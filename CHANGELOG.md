@@ -1,5 +1,9 @@
 # Changelog
 
+## UNRELEASED
+
+- **Fix: Claude Code runs in the pi session's cwd** — hosts serving many sessions from one process (pi-web) spawned it in the host process cwd, so it loaded that directory's AGENTS.md and mirrored the session under the wrong project.
+
 ## 0.9.2 — 2026-10-07
 
 - **Fix: synthetic failure notices no longer stream as assistant output (#162)** — keeps pre-output failover working for consumers like pi-model-fallback-alias; the notice text stays on the failed turn's error event. A notice following a stalled stream also drops the dead stream's abandoned partial blocks.
