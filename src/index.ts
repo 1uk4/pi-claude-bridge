@@ -1,6 +1,6 @@
 import { createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
 import { getModels } from "@earendil-works/pi-ai/compat";
-import { buildSessionContext, compact, generateBranchSummary, keyHint, type BranchSummaryResult, type CompactionEntry, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { buildSessionContext, generateBranchSummary, keyHint, type BranchSummaryResult, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Text } from "@earendil-works/pi-tui";
@@ -663,17 +663,6 @@ async function runIsolatedSummary(
 		options?.signal?.removeEventListener("abort", onAbort);
 		try { sdkQuery?.close(); } catch {}
 	}
-}
-
-function reinjectPriorCompactionFileOps(branchEntries: Array<{ type: string; details?: unknown }>, preparation: { fileOps: { read: Set<string>; edited: Set<string> } }): void {
-	const prior = [...branchEntries]
-		.reverse()
-		.find((entry): entry is CompactionEntry => entry.type === "compaction");
-	const details = prior?.details as { readFiles?: unknown; modifiedFiles?: unknown } | undefined;
-	if (!Array.isArray(details?.readFiles) || !Array.isArray(details?.modifiedFiles)) return;
-	for (const file of details.readFiles) preparation.fileOps.read.add(String(file));
-	for (const file of details.modifiedFiles) preparation.fileOps.edited.add(String(file));
-	debug(`compact takeover: re-injected prior file ops read=${details.readFiles.length} modified=${details.modifiedFiles.length}`);
 }
 
 interface SyncResult {
@@ -2564,42 +2553,8 @@ export default function (pi: ExtensionAPI) {
 		clearSession("session_shutdown");
 	});
 
-	pi.on("session_before_compact", async (event, ctx) => {
-		if (ctx.model?.baseUrl !== "claude-bridge") return undefined;
-		debug(
-			`session_before_compact: takeover reason=${event.reason} willRetry=${event.willRetry} ` +
-			`isSplitTurn=${event.preparation.isSplitTurn} messages=${event.preparation.messagesToSummarize.length} ` +
-			`turnPrefix=${event.preparation.turnPrefixMessages.length}`,
-		);
-		try {
-			reinjectPriorCompactionFileOps(event.branchEntries, event.preparation);
-			const compaction = await compact(
-				event.preparation,
-				ctx.model,
-				undefined,
-				undefined,
-				event.customInstructions,
-				event.signal,
-				ctx.thinkingLevel,
-				isolatedStreamFn,
-				undefined,
-				undefined,
-				undefined,
-				// Routes the summary to this session's cwd (sessionCwdFor).
-				ctx.sessionManager.getSessionId(),
-			);
-			debug(`session_before_compact: takeover complete summaryLen=${compaction.summary.length}`);
-			return { compaction };
-		} catch (err) {
-			const msg = errorMessage(err);
-			debug("session_before_compact: takeover failed; cancelling to avoid native compact fallback", err);
-			ctx.ui?.notify?.(
-				`Claude bridge compact failed (${msg}); cancelled to avoid known hang. Retry, switch model, or reduce context.`,
-				"error",
-			);
-			return { cancel: true };
-		}
-	});
+	// Pi and summary extensions own compaction; native summary calls use the
+	// isolated provider path. Observe the completed rewrite below, not its owner.
 
 	// pi /compact and session-tree navigation (rewind / fork-at-point /
 	// branch switch) both mutate pi's messages array out from under the
@@ -2627,7 +2582,7 @@ export default function (pi: ExtensionAPI) {
 	// this.agent.streamFunction`). On a bridge model that reaches this provider
 	// carrying pi's internal summarization prompt, which no `before_agent_start`
 	// ever recorded, so the prompt-capture resolver has nothing to resolve it to.
-	// Take it over the way compaction is taken over: the summary runs as its own
+	// Keep branch navigation's takeover: the summary runs as its own
 	// Claude Code subprocess, never touching the live session or the resolver.
 	pi.on("session_before_tree", async (event, ctx) => {
 		if (ctx.model?.baseUrl !== "claude-bridge") return undefined;
