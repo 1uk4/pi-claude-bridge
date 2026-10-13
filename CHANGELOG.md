@@ -5,6 +5,7 @@
 - **Fix: hang when a stream is cut right after a tool call starts (#146)** — Tool calls now dispatch only once their block closes, so pi no longer gets a `{}`-argument call Claude Code has dropped. Thanks @andreypopp.
 - **Fix: tool result after a restart resumes the turn (#174)** — a result with no parked query ends the turn only after an abort this process saw; otherwise (restart, crash, stall) it resumes the Claude Code session. Thanks @jcwasher.
 - **Fix: Claude Code runs in the pi session's cwd** — hosts serving many sessions from one process (pi-web) spawned it in the host process cwd, so it loaded that directory's AGENTS.md and mirrored the session under the wrong project.
+- **Add: report plan usage through pi's `after_provider_response`** — Claude Code's usage updates arrive as `anthropic-ratelimit-unified-*` headers, so extensions that read usage from the built-in `anthropic` provider work with the bridge too.
 
 ## 0.9.2 — 2026-10-07
 
