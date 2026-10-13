@@ -4,9 +4,12 @@ import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsMana
 import activate, { __test } from "../src/index.js";
 import { activateWithMockPi } from "./lib/mock-pi.mjs";
 
-it("bridge leaves session_before_compact ownership to Pi and other extensions", () => {
+it("bridge leaves compaction and branch-summary ownership to Pi and other extensions", () => {
 	const handlers = activateWithMockPi();
-	try { assert.equal(handlers.has("session_before_compact"), false); }
+	try {
+		assert.equal(handlers.has("session_before_compact"), false);
+		assert.equal(handlers.has("session_before_tree"), false);
+	}
 	finally { handlers.get("session_shutdown")({}, { sessionManager: { getSessionId: () => "coexistence" } }); }
 });
 

@@ -3,8 +3,7 @@
 //
 // Unlike the manual /compact tests, this goes through pi's pre-prompt
 // AgentSession._checkCompaction() path and observes threshold compaction events.
-// keepRecentTokens=50 intentionally forces the split-turn dual-summary path that
-// used to hang through streamClaudeAgentSdk.
+// keepRecentTokens=50 forces separate history and turn-prefix summary calls.
 
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -132,6 +131,7 @@ try {
 
 	const debugLog = readFileSync(DEBUG_LOG, "utf8");
 	assert(!/session_before_compact: takeover/.test(debugLog), "bridge must not take over compaction");
+	assert(/provider: one-off summarizer call \(cacheRetention none\) routed to isolated summary/.test(debugLog), "native compaction must route via the provider marker");
 	const compactSpawns = [...debugLog.matchAll(/compact summary: spawn/g)].length;
 	assert(compactSpawns >= 2, `expected at least 2 isolated compact summary spawns, got ${compactSpawns}`);
 	assert(!/currentPiStream overwritten/.test(debugLog), "debug log reported currentPiStream overwrite");
