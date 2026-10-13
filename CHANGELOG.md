@@ -4,11 +4,11 @@
 
 - **Fix: hang when a stream is cut right after a tool call starts (#146)** — Tool calls now dispatch only once their block closes, so pi no longer gets a `{}`-argument call Claude Code has dropped. Thanks @andreypopp.
 - **Fix: tool result after a restart resumes the turn (#174)** — a result with no parked query ends the turn only when pi delivers it on an aborted request; otherwise (restart, crash, stall, retry) it resumes the Claude Code session. Thanks @jcwasher.
-- **Fix: Claude Code runs in the pi session's cwd** — hosts serving many sessions from one process (pi-web) spawned it in the host process cwd, so it loaded that directory's AGENTS.md and mirrored the session under the wrong project.
-- **Add: report plan usage through pi's `after_provider_response`** — Claude Code's usage updates arrive as `anthropic-ratelimit-unified-*` headers, so extensions that read usage from the built-in `anthropic` provider work with the bridge too.
-- **Fix: one-off calls honour the caller's reasoning level** — compaction summaries, `/bug-report` summaries and extension one-shots that pass `reasoning` now send it to Claude Code as `effort` instead of using its default.
+- **Fix: Claude Code runs in the pi session's cwd (#175)** — hosts serving many sessions from one process (pi-web) spawned it in the host process cwd, so it loaded that directory's AGENTS.md and mirrored the session under the wrong project. Thanks @SoulKyu.
+- **Add: report plan usage through pi's `after_provider_response` (#171)** — Claude Code's usage updates arrive as `anthropic-ratelimit-unified-*` headers, so extensions that read usage from the built-in `anthropic` provider work with the bridge too. Thanks @fj.
+- **Fix: one-off calls honour the caller's reasoning level (#184)** — compaction summaries, `/bug-report` summaries and extension one-shots that pass `reasoning` now send it to Claude Code as `effort` instead of using its default. Thanks @roberthmms.
 - **Fix: exhausted subscription windows go straight to fallback (#183)** — the error now leads with "Claude quota exceeded", which pi does not retry, and still says "rate limit" for fallback chains. Thanks @good-nightmoon.
-- **Fix: tools with a top-level `anyOf`/`oneOf`/`allOf` schema (issue #179)** — Claude Code dropped them, so a call could run twice or hang the turn. The bridge now flattens the schema the way CC's own normalizer does.
+- **Fix: tools with a top-level `anyOf`/`oneOf`/`allOf` schema (#180, issue #179)** — Claude Code dropped them, so a call could run twice or hang the turn. The bridge now flattens the schema the way CC's own normalizer does. Thanks @MataM15.
 
 ## 0.9.2 — 2026-10-07
 
