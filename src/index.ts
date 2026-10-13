@@ -518,13 +518,15 @@ function resultErrorText(message: SDKMessage): string | undefined {
  *  6:30pm", which matches none of them, so an exhausted quota reads as a fatal error and the
  *  fallback chain never runs (issue #58).
  *
- *  Leading with "Claude rate limit" rather than appending keeps the phrase in any truncated
- *  render, and avoids the `<tool> failed (exit N):` shape that pi-subagents treats as a tool
- *  failure and refuses to retry. */
+ *  Leading with "Claude quota exceeded — rate limit" rather than appending keeps both phrases
+ *  in any truncated render, and avoids the `<tool> failed (exit N):` shape that pi-subagents
+ *  treats as a tool failure and refuses to retry. "quota exceeded" is on pi-ai's non-retryable
+ *  list, which wins over its retryable "rate limit" pattern, so pi hands the rejected window
+ *  straight to fallback instead of retrying a limit that resets in hours (issue #183). */
 function describeRateLimitFailure(rejection: { rateLimitType?: string; resetsAt?: number }, failure: string): string {
 	const kind = rejection.rateLimitType ? ` (${rejection.rateLimitType})` : "";
 	const resets = rejection.resetsAt ? ` — resets ${new Date(rejection.resetsAt * 1000).toLocaleTimeString()}` : ""; // resetsAt: Unix seconds (unit undocumented in the SDK; observed)
-	return `Claude rate limit${kind}${resets}: ${failure}`;
+	return `Claude quota exceeded — rate limit${kind}${resets}: ${failure}`;
 }
 
 /** Reports to the call that owns the open stream, before its next event, as pi's own

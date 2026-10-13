@@ -7,6 +7,7 @@
 - **Fix: Claude Code runs in the pi session's cwd** — hosts serving many sessions from one process (pi-web) spawned it in the host process cwd, so it loaded that directory's AGENTS.md and mirrored the session under the wrong project.
 - **Add: report plan usage through pi's `after_provider_response`** — Claude Code's usage updates arrive as `anthropic-ratelimit-unified-*` headers, so extensions that read usage from the built-in `anthropic` provider work with the bridge too.
 - **Fix: one-off calls honour the caller's reasoning level** — compaction summaries, `/bug-report` summaries and extension one-shots that pass `reasoning` now send it to Claude Code as `effort` instead of using its default.
+- **Fix: exhausted subscription windows go straight to fallback (#183)** — the error now leads with "Claude quota exceeded", which pi does not retry, and still says "rate limit" for fallback chains. Thanks @good-nightmoon.
 - **Fix: tools with a top-level `anyOf`/`oneOf`/`allOf` schema (issue #179)** — Claude Code dropped them, so a call could run twice or hang the turn. The bridge now flattens the schema the way CC's own normalizer does.
 
 ## 0.9.2 — 2026-10-07
