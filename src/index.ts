@@ -2579,7 +2579,7 @@ export default function (pi: ExtensionAPI) {
 				undefined,
 				event.customInstructions,
 				event.signal,
-				undefined,
+				ctx.thinkingLevel,
 				isolatedStreamFn,
 				undefined,
 			);
