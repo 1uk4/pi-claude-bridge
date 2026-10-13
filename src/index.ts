@@ -953,6 +953,9 @@ function mapToolArgs(
 let piUI: ExtensionUIContext | null = null;
 let piMode: ExtensionContext["mode"] | null = null;
 const activeQueryContexts = new Set<QueryContext>();
+// pi session ids whose query this process aborted. A tool result with no parked
+// query is orphaned only after one of these; after a restart it resumes instead.
+const abortedSessionIds = new Set<string>();
 
 // Defaults that silently cost the user something (no Opus 1M on Max, no
 // AskClaude tool) are announced once. Deferred to the first bridge query rather
@@ -1705,6 +1708,13 @@ const CONTINUE_AFTER_REWRITE_PROMPT =
 	"[Your context was compacted. What precedes this is a summary plus the most recent messages, "
 	+ "ending with the tool result you were waiting for. Continue the task from there.]";
 
+/** The prompt a resumed tool result is opened with: no query of this process
+ *  was parked on it (a restart, a crash, a stall), so the turn goes on from
+ *  history that ends at the result. */
+const CONTINUE_AFTER_RESUME_PROMPT =
+	"[Your session was interrupted and resumed. What precedes this ends with the tool result "
+	+ "you were waiting for. Continue the task from there.]";
+
 /** Drop a Claude Code query parked at a tool boundary whose conversation pi has
  *  since rewritten (/compact, tree navigation).
  *
@@ -1830,8 +1840,15 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// emit end_turn so pi waits for the next real user message. The discard
 	// branch above already siphoned off the stale-query case, which goes on to a
 	// rebuild instead — that one has somewhere to deliver the result to.
+	// Only after an abort this process saw: a result that arrives after a restart
+	// (a durable host resuming a run) has no parked query either, and falls
+	// through to the fresh-query path, which resumes the CC session and delivers it.
+	// So does any other result with no parked query and no recorded abort, e.g.
+	// after a crash or stall.
 	const lastMsg = context.messages[context.messages.length - 1];
-	if (lastMsg?.role === "toolResult" && !rewrittenUnderQuery) {
+	const unparkedToolResult = lastMsg?.role === "toolResult" && !rewrittenUnderQuery;
+	const abortObserved = !options?.sessionId || abortedSessionIds.has(options.sessionId);
+	if (unparkedToolResult && abortObserved) {
 		debug(`provider: orphaned tool result after abort, emitting end_turn`);
 		// With no query in flight anywhere, the top-level session this result
 		// belongs to is the one whose turn just ended: its cursor advances to
@@ -1945,6 +1962,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	if (rewrittenUnderQuery && !promptText && !promptBlocks) {
 		promptText = CONTINUE_AFTER_REWRITE_PROMPT;
 		debug(`provider: continuing the turn after a rewritten history, ${context.messages.length} msgs rebuilt`);
+	}
+	if (unparkedToolResult && !promptText && !promptBlocks) {
+		promptText = CONTINUE_AFTER_RESUME_PROMPT;
+		debug(`provider: resuming the turn at a tool result with no parked query, ${context.messages.length} msgs`);
 	}
 
 	// Guard: empty prompt means the last context message isn't a user message.
@@ -2069,6 +2090,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	};
 	const onAbort = () => {
 		wasAborted = true;
+		if (options?.sessionId) abortedSessionIds.add(options.sessionId);
 		drainForAbort(abortCtx, promptStream);
 		requestAbort();
 	};
