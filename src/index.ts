@@ -27,7 +27,7 @@ import { createToolServer } from "./mcp-server.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
 import { askClaudeCallTags, askClaudeToolDescription, buildAskClaudeParams, resolveAskClaudeDefaults, resolveAskClaudeMode, type AskClaudeMode } from "./askclaude-schema.js";
 import { nonSystemMessages, toBridgeContext } from "./transcript.js";
-import { forgetSessionCwd, rememberSessionCwd, sessionCwdFor } from "./session-cwd.js";
+import { forgetSessionCwd, rememberSessionCwd, rememberSummarySession, sessionCwdFor, summarySessionFor } from "./session-cwd.js";
 import { updateUsage, type SdkUsage } from "./usage.js";
 import { rateLimitResponse } from "./rate-limit.js";
 
@@ -578,7 +578,7 @@ async function runIsolatedSummary(
 			? extractUserPrompt(context.messages)
 			: extractIsolatedSummaryPrompt(context.messages);
 		if (!promptText) throw new Error("runIsolatedSummary: one-off summary without a user prompt (last message is not user?)");
-		const cwd = sessionCwdFor(options?.sessionId);
+		const cwd = sessionCwdFor(summarySessionFor(options?.signal) ?? options?.sessionId);
 		const compactProviderSettings = loadConfig(cwd).provider;
 		const claudeExecutable = compactProviderSettings?.pathToClaudeCodeExecutable;
 		const cliModel = claudeCodeModelId(model, longContextSettings);
@@ -2466,6 +2466,12 @@ export default function (pi: ExtensionAPI) {
 		if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
 			clearSession(`session_start:${event.reason}`);
 		}
+	});
+	pi.on("session_before_compact", (event, ctx) => {
+		rememberSummarySession(event.signal, ctx.sessionManager.getSessionId());
+	});
+	pi.on("session_before_tree", (event, ctx) => {
+		rememberSummarySession(event.signal, ctx.sessionManager.getSessionId());
 	});
 	// `--system-prompt` replaces pi's default rather than adding to it, but Claude
 	// Code's preset carries its own tool and permission guidance that the bridge

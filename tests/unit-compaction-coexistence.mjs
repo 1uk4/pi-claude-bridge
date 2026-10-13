@@ -7,8 +7,10 @@ import { activateWithMockPi } from "./lib/mock-pi.mjs";
 it("bridge leaves compaction and branch-summary ownership to Pi and other extensions", () => {
 	const handlers = activateWithMockPi();
 	try {
-		assert.equal(handlers.has("session_before_compact"), false);
-		assert.equal(handlers.has("session_before_tree"), false);
+		const ctx = { sessionManager: { getSessionId: () => "coexistence" } };
+		for (const name of ["session_before_compact", "session_before_tree"]) {
+			assert.equal(handlers.get(name)({ signal: new AbortController().signal }, ctx), undefined);
+		}
 	}
 	finally { handlers.get("session_shutdown")({}, { sessionManager: { getSessionId: () => "coexistence" } }); }
 });
