@@ -1982,6 +1982,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// Which pi session this query serves — the attribution key for history
 	// rewrites (session_compact / session_tree) and for SessionState above.
 	const piSessionId = options?.sessionId ?? null;
+	// Read before the consume below: with no query parked (an overflow retried
+	// after compaction), the session's mark is the only sign of the rewrite.
+	const historyRewritten = rewrittenUnderQuery || (piSessionId !== null && historyRewrittenBySession.has(piSessionId));
 	const syncResult = syncSharedSession(context.messages, cwd, customToolNameToSdk, cliModel, piSessionId);
 	// This query starts from the history pi has now: consume this session's
 	// armed rewrite — a sibling pi session's stays armed for its own queries.
@@ -1990,12 +1993,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const promptBlocks = extractUserPromptBlocks(context.messages);
 	let promptText = extractUserPrompt(context.messages) ?? "";
 
-	// A turn continuing past a discarded query ends at its tool result, not at a
+	// A turn continuing past a rewrite ends at its tool result, not at a
 	// prompt, so say what happened rather than falling into the empty-prompt
 	// recovery below — that one is for a shape we do not expect, and this is one
 	// we do. The rebuilt session already ends with the tool result, placed after
 	// the tool call it answers.
-	if (rewrittenUnderQuery && !promptText && !promptBlocks) {
+	if (historyRewritten && !promptText && !promptBlocks) {
 		promptText = CONTINUE_AFTER_REWRITE_PROMPT;
 		debug(`provider: continuing the turn after a rewritten history, ${context.messages.length} msgs rebuilt`);
 	}

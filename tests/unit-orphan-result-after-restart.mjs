@@ -21,7 +21,7 @@ process.env.CLAUDE_CONFIG_DIR = claudeDir;
 process.on("exit", () => rmSync(claudeDir, { recursive: true, force: true }));
 
 const mod = await import("../src/index.js");
-const { setQuery, resetSharedSession, activeQueryContexts } = mod.__test;
+const { setQuery, resetSharedSession, activeQueryContexts, markRebuildForSession } = mod.__test;
 let providerConfig;
 mod.default({
 	on: () => {},
@@ -68,14 +68,16 @@ beforeEach(() => {
 	activeQueryContexts.clear();
 	calls.length = 0;
 	scripts.length = 0;
-	setQuery(({ options }) => {
+	setQuery(({ prompt, options }) => {
 		const script = scripts.shift();
 		if (!script) throw new Error("no fake script queued");
-		calls.push({ label: script.label, resume: options.resume });
+		const call = { label: script.label, resume: options.resume };
+		calls.push(call);
 		// close() is how the bridge kills CC on abort; it ends a parked script.
 		let closed = false, onClose;
 		const killed = new Promise((r) => { onClose = r; });
 		const gen = (async function* () {
+			call.prompt = (await prompt[Symbol.asyncIterator]().next()).value.message.content[0].text;
 			for (const step of script.steps) {
 				if (closed) return;
 				if (typeof step === "function") { await step(killed); continue; }
@@ -99,7 +101,20 @@ describe("tool result with no parked query", () => {
 			{ sessionId: "pi-restarted" }).result();
 
 		assert.equal(calls.length, 1, "the result carries the turn into a fresh query");
+		assert.match(calls[0].prompt, /interrupted and resumed/);
 		assert.equal(replyText(reply), "answer after restart");
+	});
+
+	it("after compaction rewrote the history, tells Claude Code its context was compacted", async () => {
+		// An overflow: pi compacts with no query parked, then retries from the
+		// rewritten history, which ends at a tool result.
+		markRebuildForSession("pi-compacted", "session_compact:overflow");
+		scripts.push({ label: "rebuilt", steps: [init("cc-rebuilt"), ...text("continued"), result("continued")] });
+		await streamSimple(model, { messages: [user("read a"), toolCall("toolu_7"), toolResult("toolu_7")], tools: [] },
+			{ sessionId: "pi-compacted" }).result();
+
+		assert.equal(calls.length, 1);
+		assert.match(calls[0].prompt, /context was compacted/);
 	});
 
 	it("after an abort, ends the turn without a query", async () => {
