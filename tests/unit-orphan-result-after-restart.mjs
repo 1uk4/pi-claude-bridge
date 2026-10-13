@@ -153,6 +153,36 @@ describe("tool result with no parked query", () => {
 		assert.equal(replyText(reply), "resumed");
 	});
 
+	it("a parked query that fails resumes on pi's retry, even after an earlier abort (#192)", async () => {
+		const controller = new AbortController();
+		scripts.push({ label: "aborted", steps: [init("cc-old"), ...toolUse("toolu_8"), (killed) => killed] });
+		const first = streamSimple(model, { messages: [user("read a")], tools: [] }, { sessionId: "pi-failed", signal: controller.signal });
+		await settle();
+		controller.abort();
+		await first.result();
+
+		// The query parks on a tool call, then fails (a quota error) once its result arrives.
+		let fail;
+		const failure = new Promise((r) => { fail = r; });
+		scripts.push({ label: "failing", steps: [init("cc-failing"), ...toolUse("toolu_9"), async () => { await failure; throw new Error("rate limit (five_hour)"); }] });
+		const ask = user("read b");
+		const tools = [{ name: "read", description: "Read a file", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } }];
+		const parked = await streamSimple(model, { messages: [ask], tools }, { sessionId: "pi-failed", signal: new AbortController().signal }).result();
+		assert.equal(parked.stopReason, "toolUse");
+		const history = [ask, parked, toolResult("toolu_9")];
+		const failing = streamSimple(model, { messages: history, tools }, { sessionId: "pi-failed", signal: new AbortController().signal });
+		fail();
+		assert.equal((await failing.result()).stopReason, "error");
+		await settle();
+
+		// pi retries the same history on a fresh signal.
+		scripts.push({ label: "retry", steps: [init("cc-retry"), ...text("answer after retry"), result("answer after retry")] });
+		const reply = await streamSimple(model, { messages: history, tools }, { sessionId: "pi-failed", signal: new AbortController().signal }).result();
+
+		assert.equal(calls.length, 3, "the retry starts a fresh query");
+		assert.equal(replyText(reply), "answer after retry");
+	});
+
 	it("an abort in one session does not orphan another session's resumed result", async () => {
 		const controller = new AbortController();
 		scripts.push({ label: "parked", steps: [init("cc-other"), ...toolUse("toolu_3"), (killed) => killed] });
