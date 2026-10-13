@@ -580,9 +580,11 @@ async function runIsolatedSummary(
 		const compactProviderSettings = loadConfig(cwd).provider;
 		const claudeExecutable = compactProviderSettings?.pathToClaudeCodeExecutable;
 		const cliModel = claudeCodeModelId(model, longContextSettings);
-		debug(`compact summary: spawn model=${cliModel} registeredModel=${model.id} promptLen=${promptText.length}`);
+		// Honour the caller's reasoning level, same mapping as the provider path.
+		const effort = effortForReasoning(model, options?.reasoning);
+		debug(`compact summary: spawn model=${cliModel} registeredModel=${model.id} effort=${effort ?? "default"} promptLen=${promptText.length}`);
 
-		sdkQuery = query({
+		sdkQuery = queryImpl({
 			prompt: promptText,
 			options: {
 				cwd,
@@ -596,6 +598,7 @@ async function runIsolatedSummary(
 				systemPrompt: context.systemPrompt,
 				model: cliModel,
 				maxTurns: 1,
+				...(effort ? { effort } : {}),
 				...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
 				...makeCliDebugOptions("compact-summary"),
 			},
@@ -858,9 +861,7 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 	return { sessionId: session.sessionId };
 }
 
-// The SDK's query(), or a test double (see setQuery). The compact/summary
-// path calls the real query() directly — its subprocess must never be swapped
-// out from under a real compaction.
+// The SDK's query(), or a test double (see setQuery).
 let queryImpl: typeof query = query;
 
 // @internal
@@ -894,6 +895,8 @@ export const __test = {
 		piUI = ui;
 	},
 	toBridgeContext,
+	isolatedStreamFn,
+	effortForReasoning,
 	syncSharedSession,
 	extractUserPromptBlocks,
 	consumeQuery,
@@ -1145,10 +1148,25 @@ function logServedContextWindow(label: string, message: SDKMessage, model: Model
 // Pi reasoning levels → CC SDK effort levels
 
 const REASONING_TO_EFFORT: Record<string, EffortLevel> = {
-	minimal: "low", low: "low", medium: "medium", high: "high", xhigh: "max",
+	minimal: "low", low: "low", medium: "medium", high: "high", xhigh: "max", max: "max",
 };
 
 const VALID_EFFORTS = new Set<string>(["low", "medium", "high", "xhigh", "max"]);
+
+// Prefer the model's own thinkingLevelMap (per-model overrides — e.g. a map can
+// route xhigh→xhigh where the generic table maps xhigh→max). pi-ai's catalog
+// ships a map for most Claude models; the table above covers models without
+// one, and the levels a map leaves unnamed. A null entry means the level is
+// unsupported on that model: no effort argument is sent, so Claude Code's own
+// default applies rather than the generic table's value. Map values are
+// provider-generic strings, so a map value is trusted only when it names a
+// level CC accepts.
+function effortForReasoning(model: Model<any>, reasoning: string | undefined): EffortLevel | undefined {
+	if (!reasoning) return undefined;
+	const mapped = model.thinkingLevelMap?.[reasoning];
+	if (mapped === undefined) return REASONING_TO_EFFORT[reasoning];
+	return VALID_EFFORTS.has(mapped as EffortLevel) ? mapped as EffortLevel : undefined;
+}
 
 // --- Provider helpers: misc ---
 
@@ -2024,20 +2042,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const strictMcpConfigEnabled = providerSettings.strictMcpConfig !== false;
 	const claudeExecutable = providerSettings.pathToClaudeCodeExecutable;
 
-	// Prefer the model's own thinkingLevelMap (per-model overrides — e.g. a map can
-	// route xhigh→xhigh where the generic table maps xhigh→max). pi-ai's catalog
-	// ships a map for most Claude models; the table below covers models without
-	// one, and the levels a map leaves unnamed. A null entry means the level is
-	// unsupported on that model: no effort argument is sent, so Claude Code's own
-	// default applies rather than the generic table's value. Map values are
-	// provider-generic strings, so a map value is trusted only when it names a
-	// level CC accepts.
-	const mapped = options?.reasoning ? model.thinkingLevelMap?.[options.reasoning] : undefined;
-	const effort = options?.reasoning
-		? mapped === undefined
-			? REASONING_TO_EFFORT[options.reasoning]
-			: VALID_EFFORTS.has(mapped as EffortLevel) ? mapped as EffortLevel : undefined
-		: undefined;
+	const effort = effortForReasoning(model, options?.reasoning);
 
 	const extraArgs: Record<string, string | null> = { model: cliModel };
 	if (strictMcpConfigEnabled) extraArgs["strict-mcp-config"] = null;
