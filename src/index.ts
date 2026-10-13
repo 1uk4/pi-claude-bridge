@@ -530,10 +530,10 @@ function describeRateLimitFailure(rejection: { rateLimitType?: string; resetsAt?
  *  providers do. A failing consumer must not end the turn it is observing. */
 async function reportHeldRateLimit(c: QueryContext, model: Model<any>): Promise<void> {
 	const info = c.heldRateLimit;
-	if (!info || !c.currentPiStream) return;
+	if (!info || !c.currentPiStream || !c.currentOnResponse) return;
 	c.heldRateLimit = undefined;
 	try {
-		await c.currentOnResponse?.(rateLimitResponse(info), model);
+		await c.currentOnResponse(rateLimitResponse(info), model);
 	} catch (error) {
 		debug("rate limit: onResponse failed", error);
 	}
@@ -1891,6 +1891,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// 2. Fresh child context — constructor already gave us clean Maps and empty
 	//    arrays. For a reused top-level context, clear explicitly.
 	claimCurrentPiStream(stream, "fresh-query", queryCtx, options);
+	// A held event belongs to the query that received it, not to this request.
+	queryCtx.heldRateLimit = undefined;
 	queryCtx.pendingToolCalls.clear();
 	queryCtx.pendingResults.clear();
 	// Stale ids would let a late result from the previous query route here via
@@ -2093,6 +2095,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				markStreamComplete(stream);
 				stream?.end();
 				queryCtx.currentPiStream = null;
+				queryCtx.heldRateLimit = undefined;
 				return;
 			}
 
@@ -2133,6 +2136,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			if ((wasAborted || options?.signal?.aborted)) {
 				const state = sessionStateFor(queryCtx.piSessionId);
 				if (state) setSessionStateFor(queryCtx.piSessionId, { ...state, needsRebuild: true, forceRotate: true });
+				queryCtx.heldRateLimit = undefined;
 			} else {
 				// Drop this session's mirror: its conversation is in an unknown
 				// state after the error. Other sessions' mirrors stay — one

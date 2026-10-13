@@ -175,4 +175,41 @@ describe("delivery to the provider call that owns the stream", () => {
 		assert.ok(!second.includes("usage 0.05"), `a newer event replaces a held one: ${second}`);
 		assert.deepEqual(second.slice(-3), ["text_end", "usage 0.2", "done"], `an event on an open stream precedes its end: ${second}`);
 	});
+
+	it("drops an aborted query's held event instead of reporting it on the next query", async () => {
+		const usageConsumed = gate(), closed = gate();
+		const queries = [
+			async function* () {
+				yield { type: "system", subtype: "init", session_id: "cc-rate-limit-abort" };
+				yield* toolUse("toolu_1");
+				yield usage(0.1);
+				usageConsumed.open();
+				await closed.wait();
+			},
+			async function* () {
+				yield { type: "system", subtype: "init", session_id: "cc-rate-limit-next" };
+				yield* textReply;
+				yield { type: "result", subtype: "success", is_error: false, result: "done" };
+			},
+		];
+		__test.setQuery(() => {
+			const gen = queries.shift()();
+			gen.interrupt = async () => {};
+			gen.close = () => closed.open();
+			return gen;
+		});
+		const first = [], second = [];
+		const tools = [{ name: "read", description: "read", parameters: { type: "object", properties: {} } }];
+		const abort = new AbortController();
+
+		await drain(providerConfig.streamSimple(model, { messages: [user], tools }, { sessionId: "pi-rate-limit-abort", signal: abort.signal, onResponse: reportingTo(first) }), first);
+		await usageConsumed.wait();
+		abort.abort();
+		await new Promise(setImmediate);
+		const next = { role: "user", content: "something else", timestamp: 3 };
+		await drain(providerConfig.streamSimple(model, { messages: [user, call, next], tools }, { sessionId: "pi-rate-limit-abort", onResponse: reportingTo(second) }), second);
+
+		assert.ok(!second.some((e) => e.startsWith("usage")), `the next query hears nothing from the aborted one: ${second}`);
+		assert.equal(second.at(-1), "done");
+	});
 });
