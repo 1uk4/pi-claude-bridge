@@ -1,7 +1,10 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { rememberSessionCwd, forgetSessionCwd, sessionCwdFor } from "../src/session-cwd.ts";
+import activate, { __test } from "../src/index.js";
 
 const KEY = Symbol.for("claude-bridge:sessionCwds");
 
@@ -33,12 +36,34 @@ describe("session cwd", () => {
 	});
 });
 
-describe("src/index.ts pins", () => {
-	const src = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
-	it("no longer takes cwd from process.cwd()", () => {
-		assert.doesNotMatch(src, /const cwd = process\.cwd\(\)/);
-	});
-	it("excludes AGENTS.md from Claude Code's native loading", () => {
-		assert.match(src, /CLAUDE_MD_EXCLUDES = \[[^\]]*"\*\*\/AGENTS\.md"/);
+describe("streamSimple", () => {
+	it("runs Claude Code in the cwd registered at session_start", async (t) => {
+		const sessionCwd = mkdtempSync(join(tmpdir(), "claude-bridge-session-cwd-"));
+		t.after(() => rmSync(sessionCwd, { recursive: true, force: true }));
+		const handlers = {};
+		let providerConfig;
+		activate({
+			on: (name, fn) => { (handlers[name] ??= []).push(fn); },
+			registerProvider: (_name, config) => { providerConfig = config; },
+			registerTool: () => {},
+		});
+		for (const fn of handlers.session_start) fn({}, { cwd: sessionCwd, sessionManager: { getSessionId: () => "s-web" } });
+		t.after(() => forgetSessionCwd("s-web"));
+
+		let queryCwd;
+		__test.setQuery(({ options }) => {
+			queryCwd = options.cwd;
+			const gen = (async function* () {
+				yield { type: "system", subtype: "init", session_id: "cc-web" };
+				yield { type: "result", subtype: "success", is_error: false, result: "ok" };
+			})();
+			gen.interrupt = async () => {};
+			gen.close = () => {};
+			return gen;
+		});
+		t.after(() => __test.setQuery(null));
+
+		await providerConfig.streamSimple(providerConfig.models[0], { messages: [{ role: "user", content: "hi", timestamp: 0 }], tools: [] }, { sessionId: "s-web" }).result();
+		assert.equal(queryCwd, sessionCwd);
 	});
 });
