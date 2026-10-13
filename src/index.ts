@@ -15,7 +15,7 @@ import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
 import { QueryContext, ctx } from "./query-state.js";
 import { makePromptStream, userMessage, type PromptStream } from "./prompt-stream.js";
-import { claudeCodeSettings, loadConfig, markStartupNoticeShown, type Config } from "./config.js";
+import { claudeCodeSettings, loadConfig, markAskClaudeDeprecationNoticeShown, markStartupNoticeShown, type Config } from "./config.js";
 import {
 	collectPromptSkills,
 	projectPromptCapture,
@@ -962,8 +962,8 @@ let piUI: ExtensionUIContext | null = null;
 let piMode: ExtensionContext["mode"] | null = null;
 const activeQueryContexts = new Set<QueryContext>();
 
-// Defaults that silently cost the user something (no Opus 1M on Max, no
-// AskClaude tool) are announced once. Deferred to the first bridge query rather
+// Defaults that silently cost the user something (no Opus 1M on Max) are
+// announced once. Deferred to the first bridge query rather
 // than session_start: the notice persists a flag to the global config, and
 // firing it on startup would write that file for every pi session that merely
 // has this extension installed. One message, because consecutive info notifies
@@ -2418,6 +2418,7 @@ export default function (pi: ExtensionAPI) {
 	process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
 
 	const config = loadConfig(process.cwd());
+	let askClaudeDeprecationNoticeShown = Boolean(config.askClaudeDeprecationShown);
 	debug("loadConfig:", JSON.stringify(config));
 	providerSettings = config.provider ?? {};
 	// We need these settings to know if we're eligible for 1M context on certain models
@@ -2436,9 +2437,8 @@ export default function (pi: ExtensionAPI) {
 		console.error("claude-bridge: no models available from pi-ai's anthropic catalog — update @earendil-works/pi-ai (requires >=0.86.1)");
 	}
 
-	if (!config.startupNoticeShown) {
-		if (config.provider?.plan === undefined) pendingNotices.push('Are you using a Max plan? You need to set provider.plan to "max" to unlock 1M context in Opus.');
-		if (config.askClaude?.enabled === undefined) pendingNotices.push("The AskClaude tool is opt-in only. Set askClaude.enabled to use it.");
+	if (!config.startupNoticeShown && config.provider?.plan === undefined) {
+		pendingNotices.push('Are you using a Max plan? You need to set provider.plan to "max" to unlock 1M context in Opus.');
 	}
 
 	// Reset shared session on pi session lifecycle events
@@ -2666,6 +2666,12 @@ export default function (pi: ExtensionAPI) {
 				return new Text(text, 0, 0);
 			},
 			async execute(_id, params, signal, onUpdate, ctx) {
+				if (!askClaudeDeprecationNoticeShown && piMode === "tui") {
+					ctx.ui.notify("AskClaude is deprecated and may be removed in a future release. The Claude Code provider remains supported.", "warning");
+					markAskClaudeDeprecationNoticeShown();
+					askClaudeDeprecationNoticeShown = true;
+				}
+
 				// Guard: circular delegation
 				if (ctx.model?.baseUrl === "claude-bridge") {
 					debug("askClaude: blocked circular delegation (active provider is claude-bridge)");

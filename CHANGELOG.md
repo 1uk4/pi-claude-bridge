@@ -3,6 +3,7 @@
 ## UNRELEASED
 
 - **Remove: compaction and branch-summary takeovers (#189)** — pi runs them natively; the bridge routes summary calls to its isolated path. Other compaction extensions now work. Resolves #115. Thanks @sonSunnoi.
+- **Deprecate: AskClaude tool** — Show a one-time notice on first use; remove the startup reminder to opt in.
 - **Fix: Haiku 5.5 registered at 1M (#190)** — Claude Code serves it at 1M; the bridge registered 200K. Thanks @Blue-B.
 - **Fix: hang when a stream is cut right after a tool call starts (#146)** — Tool calls now dispatch only once their block closes, so pi no longer gets a `{}`-argument call Claude Code has dropped. Thanks @andreypopp.
 - **Fix: tool result after a restart resumes the turn (#174)** — a result with no parked query ends the turn only when pi delivers it on an aborted request; otherwise (restart, crash, stall, retry) it resumes the Claude Code session. Thanks @jcwasher.

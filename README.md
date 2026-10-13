@@ -35,22 +35,7 @@ The model list comes from pi-ai's Anthropic catalog automatically — when pi-ai
 
 ## AskClaude Tool
 
-Opt-in: set `askClaude.enabled` to `true` (see [Configuration](#configuration)). Available when using any non-claude-bridge provider. Pi's LLM can delegate tasks to Claude Code and wait for it to answer a question or perform a task. Examples of how to use:
-
-- "Ask Claude to plan a fix"
-- "If you get stuck, ask claude for help"
-- "Ask claude to review the plan in @foo.md, implement it, then ask an isolated=true claude to review the implementation"
-- "Ask claude to poke holes in this theory"
-
-Delegated calls don't read global `CLAUDE.md` files or Claude Code's skill listing, and always get Claude Code's own system prompt.
-
-### Parameters
-
-- **`prompt`** — the question or task for Claude Code
-- **`mode`** — `read` (default, read files and search/fetch on web), `none`, or `full` (read+write+bash, disable this mode with `allowFullMode: false` in config)
-- **`model`** — `opus` (default), `sonnet`, `haiku`, or a full model ID
-- **`thinking`** — effort level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`
-- **`isolated`** — when `true`, Claude gets a clean session with no conversation history (default: `false`)
+**Deprecated:** AskClaude is an opt-in legacy tool and may be removed in a future release. You should set `askClaude.enabled` to `true` (see [Configuration](#configuration)) to use it. You can recreate similar functionality with one of the many Pi subagent extensions.
 
 ## Configuration
 
@@ -92,7 +77,7 @@ Config: `~/.pi/agent/claude-bridge.json` (global) or the project Pi config direc
 - `pathToClaudeCodeExecutable` — path to the `claude` binary. Useful if your OS/filesystem has the SDK's bundled musl/glibc binaries in a place where they can't run. For example, with Nix you can set the binary to e.g. `"/home/you/.nix-profile/bin/claude"`.
 
 
-**Startup notice:** the first session lists `provider.plan` and `askClaude.enabled` if unset, then records `startupNoticeShown` in the global config so it doesn't nag again.
+**Notices:** the startup notice points out when `provider.plan` is unset and records `startupNoticeShown` in the global config. There's also a deprecation notice on first use of AskClaude that records its display date as `askClaudeDeprecationShown`.
 
 **Extension providers and models.json:** pi's `modelOverrides` in `~/.pi/agent/models.json` do not currently apply to extension-registered providers (like claude-bridge). Overriding `contextWindow` or other fields requires editing `src/models.ts` directly — to pin a model to 200K, use `provider.forceTwoHundredK` instead.
 
