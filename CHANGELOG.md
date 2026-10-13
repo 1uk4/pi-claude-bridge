@@ -2,7 +2,7 @@
 
 ## UNRELEASED
 
-- **Add: report plan usage through pi's `after_provider_response`** — Each `rate_limit_event` from Claude Code goes to the `onResponse` of the provider call that owns the open stream, as the `anthropic-ratelimit-unified-*` headers that the event can supply, so extensions that read usage from the built-in `anthropic` provider can read it from the bridge too. The bridge still renders nothing.
+- **Add: report plan usage through pi's `after_provider_response`** — Claude Code's usage updates arrive as `anthropic-ratelimit-unified-*` headers, so extensions that read usage from the built-in `anthropic` provider work with the bridge too.
 
 ## 0.9.2 — 2026-10-07
 
