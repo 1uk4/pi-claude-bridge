@@ -1,13 +1,13 @@
 /**
- * A tool result with no parked query is orphaned only after an abort this
- * process observed.
+ * A tool result with no parked query is orphaned only when pi delivers it on
+ * an aborted signal, as it does after an abort during a tool call.
  *
  * A durable host (pi-durable) checkpoints a tool call, and when its process is
  * killed mid-tool and reopened, it resumes the run by handing the provider the
  * history ending at that tool result. The new process has no parked query for
  * it, exactly like the user-abort case, and the orphan branch used to end the
  * turn with an empty reply. These pin both sides: after a restart the result
- * starts a fresh query that carries the turn on; after an observed abort it is
+ * starts a fresh query that carries the turn on; on an aborted signal it is
  * still dropped with an end_turn.
  */
 import { describe, it, beforeEach, afterEach } from "node:test";
@@ -102,7 +102,7 @@ describe("tool result with no parked query", () => {
 		assert.equal(replyText(reply), "answer after restart");
 	});
 
-	it("after an abort this process observed, ends the turn without a query", async () => {
+	it("after an abort, ends the turn without a query", async () => {
 		const controller = new AbortController();
 		scripts.push({ label: "parked", steps: [init("cc-aborted"), ...toolUse("toolu_2"), (killed) => killed] });
 		const first = streamSimple(model, { messages: [user("read a")], tools: [] }, { sessionId: "pi-aborted", signal: controller.signal });
@@ -111,11 +111,31 @@ describe("tool result with no parked query", () => {
 		await first.result();
 		activeQueryContexts.clear();
 
+		// pi calls back with the run's signal, which the abort left aborted.
 		const reply = await streamSimple(model, { messages: [user("read a"), toolCall("toolu_2"), toolResult("toolu_2")], tools: [] },
-			{ sessionId: "pi-aborted" }).result();
+			{ sessionId: "pi-aborted", signal: controller.signal }).result();
 
 		assert.equal(calls.length, 1, "no query starts for the orphaned result");
 		assert.equal(replyText(reply), "", "the turn ends empty, as before");
+	});
+
+	it("a session aborted earlier still resumes a later retry ending at a tool result", async () => {
+		const controller = new AbortController();
+		scripts.push({ label: "parked", steps: [init("cc-earlier"), ...toolUse("toolu_5"), (killed) => killed] });
+		const first = streamSimple(model, { messages: [user("read a")], tools: [] }, { sessionId: "pi-retry", signal: controller.signal });
+		await settle();
+		controller.abort();
+		await first.result();
+		activeQueryContexts.clear();
+
+		// A later run (fresh signal) retries after an overflow or quota error, with
+		// history ending at a tool result no query is parked on.
+		scripts.push({ label: "retry", steps: [init("cc-retry"), ...text("resumed"), result("resumed")] });
+		const reply = await streamSimple(model, { messages: [user("read b"), toolCall("toolu_6"), toolResult("toolu_6")], tools: [] },
+			{ sessionId: "pi-retry", signal: new AbortController().signal }).result();
+
+		assert.equal(calls.length, 2, "the retry starts a fresh query");
+		assert.equal(replyText(reply), "resumed");
 	});
 
 	it("an abort in one session does not orphan another session's resumed result", async () => {
