@@ -2581,6 +2581,10 @@ export default function (pi: ExtensionAPI) {
 				ctx.thinkingLevel,
 				isolatedStreamFn,
 				undefined,
+				undefined,
+				undefined,
+				// Routes the summary to this session's cwd (sessionCwdFor).
+				ctx.sessionManager.getSessionId(),
 			);
 			debug(`session_before_compact: takeover complete summaryLen=${compaction.summary.length}`);
 			return { compaction };
