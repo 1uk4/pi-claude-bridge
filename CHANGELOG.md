@@ -1,5 +1,9 @@
 # Changelog
 
+## UNRELEASED
+
+- **Fix: tool result after a restart resumes the turn (#174)** — a result with no parked query ends the turn only after an abort this process saw; otherwise (restart, crash, stall) it resumes the Claude Code session. Thanks @jcwasher.
+
 ## 0.9.2 — 2026-10-07
 
 - **Fix: synthetic failure notices no longer stream as assistant output (#162)** — keeps pre-output failover working for consumers like pi-model-fallback-alias; the notice text stays on the failed turn's error event. A notice following a stalled stream also drops the dead stream's abandoned partial blocks.
