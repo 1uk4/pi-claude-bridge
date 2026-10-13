@@ -67,18 +67,53 @@ function assertObjectSchema(tool: McpToolDef): void {
 // handler waits forever. Advertise a flat object instead, built the way CC's
 // normalizer does: root properties win over branch ones, root `required` stays,
 // and allOf requirements join it (anyOf/oneOf ones hold only for one branch).
-// Nothing is lost: pi still validates arguments against the full schema.
+// Like CC, branch `$ref`s into the root's `$defs`/`definitions` are followed,
+// and the lost constraint is restated as a note for the tool description, so
+// Claude's first call is likely to pass pi's validation against the full schema.
 const ROOT_COMBINATORS = ["anyOf", "oneOf", "allOf"] as const;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function flattenRootCombinators(schema: Record<string, unknown>): Record<string, unknown> {
-	const combinators = ROOT_COMBINATORS.filter((key) => key in schema);
-	if (combinators.length === 0) return schema;
+function resolveLocalRef(branch: unknown, root: Record<string, unknown>): unknown {
+	if (!isRecord(branch) || typeof branch.$ref !== "string") return branch;
+	const match = /^#\/(\$defs|definitions)\/([^/]+)$/.exec(branch.$ref);
+	const defs = match && root[match[1]];
+	const target = match && isRecord(defs) ? defs[match[2]] : undefined;
+	return isRecord(target) ? target : branch;
+}
 
-	const { anyOf: _anyOf, oneOf: _oneOf, allOf, ...rest } = schema;
+// A branch is named by its required keys, else by all of its keys.
+function branchGroup(branch: unknown): string | null {
+	if (!isRecord(branch)) return null;
+	const { required, properties } = branch;
+	if (Array.isArray(required) && required.length > 0 && required.every((key) => typeof key === "string")) return required.join(", ");
+	const keys = isRecord(properties) ? Object.keys(properties) : [];
+	return keys.length > 0 ? keys.join(", ") : null;
+}
+
+// CC's wording, so the tool reads the same as one CC normalized itself.
+function combinatorNote(combinators: readonly string[], branchesOf: (key: string) => unknown[]): string {
+	if (!combinators.includes("anyOf") && !combinators.includes("oneOf")) {
+		return "Input constraint: all listed parameters apply together (flattened from a JSON Schema allOf).";
+	}
+	const key = combinators.includes("oneOf") ? "oneOf" : "anyOf";
+	const rule = key === "oneOf" ? "Provide parameters for exactly one of" : "Provide parameters for at least one of";
+	const groups = [...new Set(branchesOf(key).map(branchGroup).filter((group) => group !== null))];
+	if (groups.length === 0) return `Input constraint: ${rule} the documented parameter groups (flattened from a JSON Schema ${key}).`;
+	return `Input constraint: ${rule}: ${groups.map((group) => `(${group})`).join(" or ")}.`;
+}
+
+function flattenRootCombinators(schema: Record<string, unknown>): { schema: Record<string, unknown>; note?: string } {
+	const combinators = ROOT_COMBINATORS.filter((key) => key in schema);
+	if (combinators.length === 0) return { schema };
+
+	const { anyOf: _anyOf, oneOf: _oneOf, allOf: _allOf, ...rest } = schema;
+	const branchesOf = (key: string) => {
+		const branches = schema[key];
+		return Array.isArray(branches) ? branches.map((branch) => resolveLocalRef(branch, schema)) : [];
+	};
 	const properties: Record<string, unknown> = {};
 	const required: string[] = [];
 	const addProperties = (source: unknown) => {
@@ -91,17 +126,14 @@ function flattenRootCombinators(schema: Record<string, unknown>): Record<string,
 	};
 
 	addProperties(schema);
-	for (const key of combinators) {
-		const branches = schema[key];
-		if (Array.isArray(branches)) for (const branch of branches) addProperties(branch);
-	}
+	for (const key of combinators) for (const branch of branchesOf(key)) addProperties(branch);
 	addRequired(schema);
-	if (Array.isArray(allOf)) for (const branch of allOf) addRequired(branch);
+	for (const branch of branchesOf("allOf")) addRequired(branch);
 
 	const flat: Record<string, unknown> = { ...rest, type: "object", properties };
 	if (required.length > 0) flat.required = required;
 	else delete flat.required;
-	return flat;
+	return { schema: flat, note: combinatorNote(combinators, branchesOf) };
 }
 
 export function createToolServer(name: string, tools: McpToolDef[]) {
@@ -110,11 +142,14 @@ export function createToolServer(name: string, tools: McpToolDef[]) {
 	for (const tool of tools) assertObjectSchema(tool);
 
 	server.server.setRequestHandler(ListToolsRequestSchema, () => ({
-		tools: tools.map((tool) => ({
-			name: tool.name,
-			description: tool.description,
-			inputSchema: flattenRootCombinators(tool.inputSchema as Record<string, unknown>),
-		})),
+		tools: tools.map((tool) => {
+			const { schema, note } = flattenRootCombinators(tool.inputSchema as Record<string, unknown>);
+			return {
+				name: tool.name,
+				description: [note, tool.description].filter(Boolean).join("\n\n"),
+				inputSchema: schema,
+			};
+		}),
 	}));
 
 	server.server.setRequestHandler(CallToolRequestSchema, async (request) => {

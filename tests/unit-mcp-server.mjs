@@ -138,16 +138,16 @@ describe("MCP tool schema advertisement", () => {
 // Pi validates arguments against the full schema itself, so the bridge only needs
 // to advertise a flat object schema that CC accepts.
 describe("MCP tool schema with top-level combinators", () => {
-	async function listSchema(inputSchema) {
+	async function listTool(inputSchema) {
 		const server = createToolServer("custom-tools", [
 			{ name: "union_tool", description: "d", inputSchema, handler: async () => ({ content: [] }) },
 		]);
 		const { request } = await connectClient(server);
-		return (await request("tools/list", {})).result.tools[0].inputSchema;
+		return (await request("tools/list", {})).result.tools[0];
 	}
 
 	it("flattens a top-level anyOf into one object schema CC accepts", async () => {
-		const listed = await listSchema({
+		const { description, inputSchema: listed } = await listTool({
 			type: "object",
 			additionalProperties: false,
 			required: ["operation"],
@@ -164,10 +164,11 @@ describe("MCP tool schema with top-level combinators", () => {
 		assert.deepStrictEqual(Object.keys(listed.properties).sort(), ["baseRef", "input", "operation"]);
 		assert.deepStrictEqual(listed.properties.operation.enum, ["start", "status"], "root declaration wins over a branch");
 		assert.deepStrictEqual(listed.required, ["operation"], "a branch-only requirement is not universal");
+		assert.strictEqual(description, "Input constraint: Provide parameters for at least one of: (operation, baseRef) or (input).\n\nd");
 	});
 
 	it("keeps allOf requirements, which apply to every call", async () => {
-		const listed = await listSchema({
+		const { description, inputSchema: listed } = await listTool({
 			type: "object",
 			properties: { a: { type: "string" } },
 			required: ["a"],
@@ -177,6 +178,28 @@ describe("MCP tool schema with top-level combinators", () => {
 		assert.ok(!("allOf" in listed));
 		assert.deepStrictEqual(Object.keys(listed.properties).sort(), ["a", "b"]);
 		assert.deepStrictEqual(listed.required, ["a", "b"]);
+		assert.ok(description.startsWith("Input constraint: all listed parameters apply together"));
+	});
+
+	it("flattens a oneOf of $defs refs and names each group in the description", async () => {
+		const { description, inputSchema: listed } = await listTool({
+			type: "object",
+			$defs: {
+				byId: { type: "object", properties: { id: { type: "string" } }, required: ["id"] },
+				byName: { type: "object", properties: { name: { type: "string" }, scope: { type: "string" } }, required: ["name"] },
+			},
+			oneOf: [{ $ref: "#/$defs/byId" }, { $ref: "#/$defs/byName" }],
+		});
+
+		assert.ok(!("oneOf" in listed));
+		assert.deepStrictEqual(Object.keys(listed.properties).sort(), ["id", "name", "scope"]);
+		assert.ok(!("required" in listed), "each branch's requirement holds only for that branch");
+		assert.strictEqual(description, "Input constraint: Provide parameters for exactly one of: (id) or (name).\n\nd");
+	});
+
+	it("leaves the description alone when there is no top-level combinator", async () => {
+		const { description } = await listTool({ type: "object", properties: { a: { type: "string" } } });
+		assert.strictEqual(description, "d");
 	});
 });
 
