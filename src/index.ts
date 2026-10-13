@@ -566,8 +566,6 @@ async function runIsolatedSummary(
 		const claudeExecutable = compactProviderSettings?.pathToClaudeCodeExecutable;
 		const cliModel = claudeCodeModelId(model, longContextSettings);
 		// Honour the caller's reasoning level, same mapping as the provider path.
-		// Compaction passes pi's session thinking level; one-off callers such as
-		// extensions pass their own.
 		const effort = effortForReasoning(model, options?.reasoning);
 		debug(`compact summary: spawn model=${cliModel} registeredModel=${model.id} effort=${effort ?? "default"} promptLen=${promptText.length}`);
 
@@ -848,9 +846,7 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 	return { sessionId: session.sessionId };
 }
 
-// The SDK's query(), or a test double (see setQuery). The compact/summary
-// path calls the real query() directly — its subprocess must never be swapped
-// out from under a real compaction.
+// The SDK's query(), or a test double (see setQuery).
 let queryImpl: typeof query = query;
 
 // @internal
@@ -1134,7 +1130,7 @@ function logServedContextWindow(label: string, message: SDKMessage, model: Model
 // Pi reasoning levels → CC SDK effort levels
 
 const REASONING_TO_EFFORT: Record<string, EffortLevel> = {
-	minimal: "low", low: "low", medium: "medium", high: "high", xhigh: "max",
+	minimal: "low", low: "low", medium: "medium", high: "high", xhigh: "max", max: "max",
 };
 
 const VALID_EFFORTS = new Set<string>(["low", "medium", "high", "xhigh", "max"]);

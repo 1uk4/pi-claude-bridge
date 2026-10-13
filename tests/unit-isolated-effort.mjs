@@ -54,6 +54,7 @@ describe("effortForReasoning", () => {
 	it("falls back to the generic table for levels the map leaves unnamed", () => {
 		assert.strictEqual(__test.effortForReasoning(fable, "high"), "high");
 		assert.strictEqual(__test.effortForReasoning(unmapped, "xhigh"), "max");
+		assert.strictEqual(__test.effortForReasoning(unmapped, "max"), "max");
 	});
 
 	it("sends no effort for unsupported or absent levels", () => {
