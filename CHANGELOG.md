@@ -2,7 +2,7 @@
 
 ## UNRELEASED
 
-- **Fix: tools with a top-level `anyOf`/`oneOf`/`allOf` schema no longer run behind Claude's back (issue #179)** — Claude Code drops such a tool ("its input schema uses top-level anyOf, which the Anthropic API does not accept"), but the bridge still served it, so a call Claude made to it anyway ran in pi while CC answered "No such tool available" and retried under a fresh id: the tool ran twice, or the retry's handler waited forever and the turn hung. The MCP server now advertises those schemas flattened into one object, the way CC's own (gated) normalizer does, so the tool stays callable; pi still validates arguments against the full schema.
+- **Fix: tools with a top-level `anyOf`/`oneOf`/`allOf` schema (issue #179)** — Claude Code dropped them, so a call could run twice or hang the turn. The bridge now flattens the schema the way CC's own normalizer does.
 
 ## 0.9.2 — 2026-10-07
 
