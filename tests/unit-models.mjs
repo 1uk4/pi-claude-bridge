@@ -158,7 +158,7 @@ describe("applyLongContext", () => {
 	});
 
 	it("haiku shortcut and no-match still resolve", () => {
-		assert.equal(resolveModel(models, "haiku")?.id, "claude-haiku-4-5");
+		assert.equal(resolveModel(models, "haiku")?.id, "claude-haiku-5-5");
 		assert.equal(resolveModel(models, "gpt-9"), undefined);
 	});
 
