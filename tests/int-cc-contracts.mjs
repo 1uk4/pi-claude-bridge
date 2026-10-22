@@ -391,8 +391,7 @@ test("JSON Schema is served verbatim — nested objects and anyOf/const survive"
 // --- Session transcripts and --resume ---
 
 test("--resume re-reads the JSONL from disk on every call", { timeout: 180_000 }, async () => {
-	// syncSharedSession's REBUILD path overwrites the session file in place and
-	// keeps the same UUID. That is only correct if CC caches nothing by UUID.
+	// Plain resumes must read the named transcript, not a process-local cached copy.
 	const sessionId = randomUUID();
 	const seed = (token) => {
 		const session = createSession({ sessionId, projectPath: CWD, claudeDir: process.env.CLAUDE_CONFIG_DIR, model: MODEL });

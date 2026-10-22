@@ -20,7 +20,7 @@
 // agent_settled), never on sleeps alone; timeouts only bound failures.
 //
 // A scenario passes its evidence check only if the state it set out to reach was
-// actually reached (e.g. a redaction really went through REUSE); otherwise it is
+// actually reached (e.g. a redaction triggered a content-difference write); otherwise it is
 // reported as not exercised. Findings come from the analyzer, not from rules
 // here. Each scenario's Claude Code sessions are deleted once it is analyzed; its
 // evidence stays under --out. Paid: each scenario is a few Haiku turns. Must run outside the sandbox.
@@ -32,9 +32,9 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameS
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { getProjectDir } from "cc-session-io";
+import { getProjectDir, openSession } from "cc-session-io";
 import { FIRST_PARTY_ENV } from "./lib/first-party.mjs";
-import { loadTrace, traceRuns } from "./lib/trace-analysis.mjs";
+import { checkPreservation, loadTrace, traceRuns } from "./lib/trace-analysis.mjs";
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2);
@@ -195,13 +195,58 @@ function wireResult(body, tool) {
 	};
 }
 
+/** The transition for a fresh-query decision, rather than a tool continuation. */
+const decisionTransition = (analysis, decision) => analysis.transitions.find((t) => t.to.callId === decision?.callId);
+const noThinkingDrops = (transition) => !(transition?.apiTransformations ?? []).some((t) => t.type === "thinking_dropped");
+
+/** Validate committed recordings against CC's selected parent chain before cleanup. */
+function recordingChecks(events, dir) {
+	const states = events.filter((e) => e.type === "session-recorded" && e.source !== "import");
+	const issues = [];
+	for (const state of states) {
+		const label = `${state.queryId}/${state.ccSessionId}`;
+		const { digests, uuids, cuttable } = state;
+		if (!Array.isArray(digests) || !Array.isArray(uuids) || !Array.isArray(cuttable) || digests.length !== uuids.length || digests.length !== cuttable.length) {
+			issues.push(`${label}: missing or misaligned recording arrays`);
+			continue;
+		}
+		const session = openSession({ sessionId: state.ccSessionId, projectPath: state.cwd, claudeDir: process.env.CLAUDE_CONFIG_DIR });
+		const recordingDir = join(dir, "recordings");
+		mkdirSync(recordingDir, { recursive: true, mode: 0o700 });
+		writeFileSync(join(recordingDir, `${state.ccSessionId}.jsonl`), readFileSync(session.jsonlPath), { mode: 0o600 });
+		const records = session.records.filter((r) => typeof r.uuid === "string" && ["user", "assistant", "attachment", "system"].includes(r.type));
+		const byId = new Map(records.map((r) => [r.uuid, r]));
+		const chain = new Set();
+		let record = records.at(-1);
+		while (record) {
+			if (chain.has(record.uuid)) throw new Error(`${label}: cycle in CC's parent chain`);
+			chain.add(record.uuid);
+			record = byId.get(record.parentUuid);
+		}
+		for (const [i, uuid] of uuids.entries()) {
+			if (uuid === null) {
+				if (cuttable[i]) issues.push(`${label}: omitted slot ${i} is cuttable`);
+				continue;
+			}
+			const resolved = byId.get(uuid) ?? records.find((r) => r.type === "attachment" && r.attachment?.type === "queued_command" && r.attachment.source_uuid === uuid);
+			// Parallel results can be siblings of the last tool-call record. Their
+			// informational slots need a real record, not a place on the leaf's parent path.
+			if (typeof uuid !== "string" || !uuid || !resolved || (cuttable[i] && !chain.has(resolved.uuid))) issues.push(`${label}: slot ${i} has no record or its cut is off the selected parent chain`);
+		}
+	}
+	return [
+		["completed queries recorded their covered pi prefixes", states.length > 0, states.length],
+		["recorded UUIDs resolve; only selected-chain boundaries can be cut", issues.length === 0, issues],
+	];
+}
+
 // --- Scenarios ---
 
 /** Each scenario: steps drive pi; check(evidence) returns [name, ok, detail] rows
  *  establishing that the intended state was reached. */
 const SCENARIOS = {
 	"noop-rebuild": {
-		contract: "Round-trip preservation across a forced no-op rebuild; snapshot taken before the delete",
+		contract: "A forced no-op sync forks at the recorded prefix without changing it",
 		async steps(ctx) {
 			const h = await ctx.pi();
 			await prompt(h, "Please look up the key alpha with the lc_lookup tool and tell me its value.");
@@ -212,16 +257,16 @@ const SCENARIOS = {
 			ctx.control({});
 			await shutdown(h);
 		},
-		check({ decisions, events, snapshots }) {
-			const snap = events.find((e) => e.type === "snapshot");
+		check({ decisions, analysis }) {
+			const last = decisions.at(-1);
+			const fork = decisionTransition(analysis, last);
 			return [
-				["decisions clean-start, reuse, rebuild-mark", decisions.map((d) => `${d.path}/${d.reason}`).join(",").match(/^clean-start\/no-priors(,reuse\/[^,]+)+,rebuild\/rebuild-mark$/), decisions.map((d) => `${d.path}/${d.reason}`)],
-				["rebuild kept the session id", decisions.at(-1)?.rotation === "preserve-id", decisions.at(-1)?.rotation],
-				["snapshot before the delete", snap && snap.seq < events.find((e) => e.type === "rebuild-written")?.seq, snap?.snapshotId],
-				["snapshot usable as a resume control", snapshots[0]?.usable, snapshots[0]?.reasons],
+				["new session, exact resumes, then a prefix fork", decisions[0]?.row === 1 && decisions.slice(1, -1).every((d) => d.row === 4) && last?.row === 6, decisions.map((d) => d.row)],
+				["the fork preserves CC's request prefix", fork?.preservation.status === "preserved", fork?.preservation],
+				["the fork reads the ancestor's cached prefix", fork?.cache.status === "covered", fork?.cache],
+				["the API drops no retained thinking", noThinkingDrops(fork), fork?.apiTransformations],
 			];
-		},
-	},
+		},	},
 
 	"thinking-rebuild": {
 		contract: "Thinking blocks across REUSE and a forced no-op rebuild: does the rebuilt history carry them as CC sent them?",
@@ -236,17 +281,15 @@ const SCENARIOS = {
 			await shutdown(h);
 		},
 		check({ decisions, analysis, captureBodies }) {
-			const rebuilt = analysis.transitions.find((t) => t.decision?.reason === "rebuild-mark");
+			const fork = decisionTransition(analysis, decisions.at(-1));
 			const thinking = (n) => thinkingIn(captureBodies[n]);
 			return [
-				// The last reply before the rebuild first appears in the rebuilt request itself.
-				["the rebuilt request carries earlier thinking blocks (the state under test)", rebuilt && thinking(rebuilt.to.request) > 0, rebuilt && { ancestor: thinking(rebuilt.from.request), rebuilt: thinking(rebuilt.to.request) }],
-				["rebuild was a no-op on the rebuild mark", decisions.at(-1)?.reason === "rebuild-mark" && rebuilt?.source.relation === "append", rebuilt?.source],
-				// Recorded either way (not a pass condition): did the API drop thinking it was sent?
-				["API reported its input changes on the rebuilt request (observation)", true, rebuilt?.apiTransformations ?? "none reported"],
+				["the fork carries earlier thinking blocks", fork && thinking(fork.to.request) > 0, fork && { ancestor: thinking(fork.from.request), fork: thinking(fork.to.request) }],
+				["the no-op sync forks at the full covered prefix", decisions.at(-1)?.row === 6 && fork?.source.relation === "append", decisions.at(-1)],
+				["retained thinking is not dropped", noThinkingDrops(fork), fork?.apiTransformations],
+				["the fork preserves the prefix and cache", fork?.preservation.status === "preserved" && fork?.cache.status === "covered", fork && { preservation: fork.preservation, cache: fork.cache }],
 			];
-		},
-	},
+		},	},
 
 	"hard-content-rebuild": {
 		contract: "An error result, an image result, output over CC's persistence threshold and thinking, across a forced no-op rebuild and one more turn",
@@ -260,29 +303,26 @@ const SCENARIOS = {
 			await prompt(h, "Thanks. Just say ok.");
 			await shutdown(h);
 		},
-		check({ decisions, events, analysis, captureBodies }) {
-			const rebuilt = analysis.transitions.find((t) => t.decision?.reason === "rebuild-mark");
-			const after = analysis.transitions.find((t) => rebuilt && t.from.request === rebuilt.to.request);
-			// Before: the last request Claude Code built from its own history; rebuilt: the first from the bridge's.
+		check({ decisions, analysis, captureBodies }) {
+			const fork = decisionTransition(analysis, decisions.find((d) => d.row === 6));
+			const after = analysis.transitions.find((t) => fork && t.from.request === fork.to.request);
 			const views = (tool) => ({
-				native: wireResult(captureBodies[rebuilt?.from.request], tool),
-				rebuilt: wireResult(captureBodies[rebuilt?.to.request], tool),
+				native: wireResult(captureBodies[fork?.from.request], tool),
+				fork: wireResult(captureBodies[fork?.to.request], tool),
 				after: wireResult(captureBodies[after?.to.request], tool),
 			});
 			const [fail, image, dump] = ["lc_fail", "lc_image", "lc_dump"].map(views);
-			const snap = events.find((e) => e.type === "snapshot");
 			return [
-				["decisions clean-start, reuse, rebuild-mark, reuse", decisions.map((d) => `${d.path}/${d.reason}`).join(",").match(/^clean-start\/no-priors(,reuse\/[^,]+)+,rebuild\/rebuild-mark,reuse\/[^,]+$/), decisions.map((d) => `${d.path}/${d.reason}`)],
-				["rebuild was a no-op that kept the session id", rebuilt?.source.relation === "append" && rebuilt?.decision?.rotation === "preserve-id", rebuilt && { source: rebuilt.source, rotation: rebuilt.decision?.rotation }],
+				["new session, exact resume, prefix fork, exact resume", JSON.stringify(decisions.map((d) => d.row)) === "[1,4,6,4]", decisions.map((d) => d.row)],
+				["the no-op fork preserves the prefix and cache", fork?.source.relation === "append" && fork?.preservation.status === "preserved" && fork?.cache.status === "covered", fork],
 				["an error tool result reached Claude Code", fail.native?.isError === true, fail],
 				["an image tool result reached Claude Code", image.native?.images.length > 0, image],
 				["an oversized tool output reached Claude Code", dump.native && (dump.native.persisted || dump.native.textChars > 50_000), dump],
-				["the rebuilt request carries earlier thinking blocks", thinkingIn(captureBodies[rebuilt?.to.request]) > 0, rebuilt && { native: thinkingIn(captureBodies[rebuilt.from.request]), rebuilt: thinkingIn(captureBodies[rebuilt.to.request]) }],
-				["snapshot before the delete", snap && snap.seq < events.find((e) => e.type === "rebuild-written")?.seq, snap && { id: snap.snapshotId, complete: snap.complete, fileCount: snap.fileCount, bytes: snap.bytes, missingReferences: snap.missingReferences, externalReferences: snap.externalReferences }],
-				["API reported its input changes (observation)", true, { rebuilt: rebuilt?.apiTransformations ?? "none reported", after: after?.apiTransformations ?? "none reported" }],
+				["the fork carries earlier thinking blocks", thinkingIn(captureBodies[fork?.to.request]) > 0, fork?.to.request],
+				["error, image and persisted output survive unchanged", [fail, image, dump].every((v) => JSON.stringify(v.native) === JSON.stringify(v.fork) && JSON.stringify(v.fork) === JSON.stringify(v.after)), { fail, image, dump }],
+				["retained thinking is not dropped", noThinkingDrops(fork), fork?.apiTransformations],
 			];
-		},
-	},
+		},	},
 
 	"abort-continuation": {
 		contract: "#199/#200: a run ends with the query parked at a terminating tool; the next run continues it and is aborted",
@@ -310,8 +350,7 @@ const SCENARIOS = {
 				["second run continued the parked query", Boolean(continuation), continuation?.queryId],
 				["the continuing run's abort reached that query", runAbort && !runAbort.runStreamEnded, runAbort],
 				["the query ended aborted", end?.outcome === "aborted", end?.outcome],
-				// The parked query never completed, so no mirror was ever recorded for it.
-				["next turn rebuilt from pi's history", decisions.at(-1)?.path === "rebuild", decisions.at(-1) && `${decisions.at(-1).path}/${decisions.at(-1).reason}`],
+				["next turn retains the covered prefix and repairs the aborted suffix", [6, 7].includes(decisions.at(-1)?.row) && decisions.at(-1)?.cutCount > 0, decisions.at(-1)],
 			];
 		},
 	},
@@ -379,7 +418,7 @@ const SCENARIOS = {
 			return [
 				["one injected error, at the tool boundary", injected.length === 1 && atBoundary, injected.map((r) => r.n)],
 				["the query reported the failure", Boolean(failed), failed],
-				["recovery turn rebuilt without a mirror", decisions.at(-1)?.reason === "no-mirror", decisions.map((d) => `${d.path}/${d.reason}`)],
+				["recovery keeps the covered prefix instead of losing the mirror", [6, 7].includes(decisions.at(-1)?.row) && decisions.at(-1)?.cutCount > 0, decisions.at(-1)],
 			];
 		},
 	},
@@ -396,13 +435,14 @@ const SCENARIOS = {
 			await prompt(h, "Great. Now look up the key gamma.");
 			await shutdown(h);
 		},
-		check({ runs, decisions }) {
+		check({ runs, decisions, analysis }) {
+			const resumed = decisionTransition(analysis, decisions.at(-1));
 			return [
 				["two pi processes traced", runs === 2, runs],
-				["resumed turn rebuilt with no mirror", decisions.at(-1)?.reason === "no-mirror", decisions.at(-1)],
+				["restart forks from persisted coverage", decisions.at(-1)?.row === 6, decisions.at(-1)],
+				["restart preserves the native prefix and cache", resumed?.preservation.status === "preserved" && resumed?.cache.status === "covered", resumed],
 			];
-		},
-	},
+		},	},
 
 	"redaction": {
 		contract: "A same-length in-process redaction without a rebuild mark must reach Claude Code",
@@ -415,11 +455,48 @@ const SCENARIOS = {
 			ctx.control({});
 			await shutdown(h);
 		},
-		check({ decisions, analysis }) {
-			const last = analysis.transitions.at(-1);
+		check({ decisions, analysis, captureBodies }) {
+			const last = decisionTransition(analysis, decisions.at(-1));
+			const sent = JSON.stringify(captureBodies[last?.to.request]?.messages);
 			return [
-				["redacted turn took REUSE (the state under test)", decisions.at(-1)?.path === "reuse", decisions.at(-1)],
+				["same-count redaction triggered a content-difference write", [5, 7].includes(decisions.at(-1)?.row), decisions.at(-1)],
 				["source history changed at the redacted message", last?.source.relation === "edit", last?.source],
+				["the mask reached CC and the secret did not", sent?.includes("XXXXXX-XXXX") && !/SECRET-[0-9]{4}/.test(sent), last?.propagation],
+			];
+		},	},
+
+	"recent-redaction": {
+		contract: "A recent edit keeps the native prefix, imports parallel results and a steer, then resumes unchanged",
+		async steps(ctx) {
+			const h = await ctx.pi();
+			await prompt(h, "Look up the key alpha with lc_lookup and tell me its value.");
+			const started = h.waitForEvent("tool_execution_start", TIMEOUT);
+			const settled = h.waitForEvent("agent_settled", TIMEOUT);
+			await h.send({ type: "prompt", message: `For ticket ${secret()}, call lc_wait twice in parallel, labels 'one' and 'two', in one message. Then report both results.` });
+			await started;
+			await h.send({ type: "prompt", message: "While you wait, also mention PAPAYA.", streamingBehavior: "steer" });
+			ctx.openGate();
+			await settled;
+			ctx.control({ redact: true });
+			await prompt(h, "Thanks. Just say ok.");
+			await prompt(h, "Thanks again. Say goodbye.");
+			ctx.control({});
+			await shutdown(h);
+		},
+		check({ decisions, events, analysis, captureBodies }) {
+			const written = decisionTransition(analysis, decisions.find((d) => d.row === 7));
+			const secondTurn = decisionTransition(analysis, decisions[1]);
+			const before = captureBodies[secondTurn?.from.request];
+			const after = captureBodies[written?.to.request];
+			const preserved = before && after && checkPreservation(before, after);
+			const sent = JSON.stringify(after?.messages);
+			return [
+				["new session, exact resume, prefix write, exact resume", JSON.stringify(decisions.map((d) => d.row)) === "[1,4,7,4]", decisions.map((d) => d.row)],
+				["parallel results and a steer exercised the imported suffix", events.some((e) => e.type === "route" && e.route === "tool-result" && e.steer && e.results.length >= 2), null],
+				["the older native request prefix is unchanged", preserved?.status === "preserved", preserved],
+				["the mask and steer reached CC without the secret", sent?.includes("XXXXXX-XXXX") && sent.includes("PAPAYA") && !/SECRET-[0-9]{4}/.test(sent), written?.propagation],
+				["the recent edit keeps the ancestor's cached prefix", written?.cache.status === "covered", written?.cache],
+				["retained thinking is not dropped", noThinkingDrops(written), written?.apiTransformations],
 			];
 		},
 	},
@@ -435,15 +512,14 @@ const SCENARIOS = {
 			await shutdown(h);
 		},
 		check({ decisions, analysis }) {
-			const rebuilt = analysis.transitions.find((t) => t.decision?.reason === "rebuild-mark");
-			// The second turn's first request: an ancestor before it is from the first turn.
+			const fork = decisionTransition(analysis, decisions.at(-1));
 			const secondTurn = analysis.transitions.find((t) => t.to.kind === "fresh");
 			return [
-				["turn after navigation rebuilt on the rebuild mark", decisions.at(-1)?.reason === "rebuild-mark", decisions.at(-1)],
-				["its ancestor is the first turn, so preservation was checked", rebuilt && rebuilt !== secondTurn && rebuilt.from.request < secondTurn?.to.request && rebuilt.preservation.status !== "not-checked", rebuilt && { from: rebuilt.from, secondTurn: secondTurn?.to.request }],
+				["turn after navigation forks at the retained pi prefix", decisions.at(-1)?.row === 6, decisions.at(-1)],
+				["its ancestor is the first turn", fork && fork !== secondTurn && fork.from.request < secondTurn?.to.request && fork.preservation.status !== "not-checked", fork && { from: fork.from, secondTurn: secondTurn?.to.request }],
+				["the fork reads the ancestor's cached prefix", fork?.cache.status === "covered", fork?.cache],
 			];
-		},
-	},
+		},	},
 
 	"compact": {
 		contract: "Compaction, then continuing: a necessary change must not conceal unrelated loss",
@@ -459,7 +535,7 @@ const SCENARIOS = {
 		check({ decisions, events }) {
 			return [
 				["compaction summary ran as an isolated side query", events.some((e) => e.type === "query-start" && e.kind === "isolated-summary"), null],
-				["turn after compaction rebuilt on the rebuild mark", decisions.at(-1)?.reason === "rebuild-mark", decisions.at(-1)],
+				["compaction writes the changed history", [5, 7].includes(decisions.at(-1)?.row), decisions.at(-1)],
 			];
 		},
 	},
@@ -506,7 +582,7 @@ for (const name of selected) {
 				return existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : null;
 			} }),
 		};
-		checks = scenario.check(evidence).map(([check, ok, detail]) => ({ check, ok: Boolean(ok), detail }));
+		checks = [...scenario.check(evidence), ...recordingChecks(events, ctx.dir)].map(([check, ok, detail]) => ({ check, ok: Boolean(ok), detail }));
 	}
 	// Missing or incomplete evidence fails the scenario even if every check passed.
 	const gaps = analyzed?.status === 0 ? JSON.parse(readFileSync(analysisFile, "utf8")).gaps : ["no analysis"];

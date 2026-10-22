@@ -48,7 +48,7 @@ try {
 
 	// First syncResult after /new must be clean-start (sharedSession=null,
 	// no prior messages on the fresh agent state).
-	const syncResults = [...postNewLog.matchAll(/syncResult: path=(reuse|rebuild|clean-start)/g)].map((m) => m[1]);
+	const syncResults = [...postNewLog.matchAll(/syncResult: path=([a-z-]+)/g)].map((m) => m[1]);
 	console.log(`  Post-/new syncResults: ${JSON.stringify(syncResults)}`);
 	if (syncResults.length === 0) {
 		throw new Error("no syncResult markers after /new (Turn 3 didn't reach the provider?)");
