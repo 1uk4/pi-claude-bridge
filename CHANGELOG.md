@@ -2,6 +2,8 @@
 
 ## UNRELEASED
 
+- **Refactor: content-based session sync (#222)** — Add stable conversation digests and a contract test for prefix forks.
+
 - **Fix: queued steering keeps MCP input open through later turns (#172)** — Keep Claude Code's input open until each steer is replayed into a turn, then close after that turn completes. An error result still ends the query, so a steer Claude Code had queued can no longer run on and replace the failure.
 
 - **Bump: Claude Agent SDK 0.3.308 (Claude Code 2.1.308)** — Claude Code's new per-request log in session files is turned off; it made them about a third larger.
