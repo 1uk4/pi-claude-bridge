@@ -713,15 +713,17 @@ function syncSharedSession(
 	const reason = piSessionId == null ? "unattributed-history" : missingFile ? "missing-transcript" : !state ? "no-state"
 		: state.model !== modelId ? "model-changed" : cwdChanged ? "cwd-changed" : forkCurrent ? "askclaude-fork"
 		: row === 4 ? "equal-digests" : state.dirtyTail && compared.equal ? "dirty-tail" : "history-difference";
-	const decision = (path: string, after: string) => traceStrict("decision", {
-		callId: traceCallId, piSessionId: piSessionId ?? null, row, path, reason,
-		commonPrefix: compared.commonPrefix, cutCount: compared.cutCount,
-		ccSessionBefore: before?.ccSessionId ?? null, ccSessionAfter: after, priors: priors.length,
-		dirtyTail: Boolean(state?.dirtyTail), missingFile, cwdChanged, cwd, mirrorCwd: before?.cwd ?? null,
-	});
+	const decision = (path: string, after: string) => {
+		traceStrict("decision", {
+			callId: traceCallId, piSessionId: piSessionId ?? null, row, path, reason,
+			commonPrefix: compared.commonPrefix, cutCount: compared.cutCount,
+			ccSessionBefore: before?.ccSessionId ?? null, ccSessionAfter: after, priors: priors.length,
+			dirtyTail: Boolean(state?.dirtyTail), missingFile, cwdChanged, cwd, mirrorCwd: before?.cwd ?? null,
+		});
+		debug(`syncResult: path=${path} sessionId=${after} priors=${priors.length} commonPrefix=${compared.commonPrefix} cutCount=${compared.cutCount} row=${row}`);
+	};
 	if (row === 4) {
 		decision("reuse", state!.ccSessionId);
-		debug(`syncResult: path=reuse sessionId=${state!.ccSessionId} covered=${state!.digests.length}`);
 		return { sessionId: state!.ccSessionId, targetSessionId: state!.ccSessionId, created: false, recorded: copyRecording(state!), state, writable };
 	}
 	if (state) traceSnapshot({ callId: traceCallId, ccSession: state.ccSessionId, cwd: state.cwd, reason: "rebuild-rotate", writer: "no-known-writer" }, true);

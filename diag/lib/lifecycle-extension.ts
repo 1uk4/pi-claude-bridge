@@ -104,9 +104,10 @@ export default function (pi: ExtensionAPI) {
 		if (!control().redact) return undefined;
 		const scrub = (s: string) => s.replace(/SECRET-[0-9]{4}/g, "XXXXXX-XXXX");
 		return {
-			messages: event.messages.map((m: any) => m.role !== "user" ? m : {
-				...m,
-				content: typeof m.content === "string" ? scrub(m.content) : m.content.map((b: any) => b.type === "text" ? { ...b, text: scrub(b.text) } : b),
+			messages: event.messages.map((m: any) => {
+				// Signed thinking cannot be edited; omit a block that contains the secret.
+				const content = typeof m.content === "string" ? m.content : m.content.filter((b: any) => b.type !== "thinking" || scrub(b.thinking ?? "") === (b.thinking ?? ""));
+				return JSON.parse(JSON.stringify({ ...m, content }, (_key, value) => typeof value === "string" ? scrub(value) : value));
 			}),
 		};
 	});
