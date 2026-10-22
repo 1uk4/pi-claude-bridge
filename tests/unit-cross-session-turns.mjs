@@ -54,6 +54,7 @@ beforeEach(() => {
 			void input.next().catch(() => {}); // SDK pump acknowledges stdin before waiting for more input
 			record("user", initial.message.content, initial.uuid);
 			yield { type: "system", subtype: "init", session_id: sessionId };
+			yield { type: "user", isReplay: true, parent_tool_use_id: null, uuid: initial.uuid, session_id: sessionId, message: initial.message };
 			const sdkAssistant = (content, id) => {
 				const value = record("assistant", content);
 				return { type: "assistant", parent_tool_use_id: null, uuid: value.uuid, session_id: sessionId, message: { id, model: model.id, content } };

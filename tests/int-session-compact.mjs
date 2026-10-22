@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { getSessionPath } from "cc-session-io";
 import { createRpcHarness } from "./lib/rpc-harness.mjs";
 
@@ -42,7 +43,7 @@ try {
 	const beforeLog = readFileSync(DEBUG_LOG, "utf8");
 	const preCompactSessionId = [...beforeLog.matchAll(/syncResult: path=[a-z-]+ sessionId=([a-f0-9-]+)/g)].at(-1)?.[1];
 	assert.ok(preCompactSessionId, "no pre-compact sessionId found");
-	const ancestorPath = getSessionPath(preCompactSessionId, process.cwd(), process.env.CLAUDE_CONFIG_DIR);
+	const ancestorPath = getSessionPath(preCompactSessionId, fileURLToPath(new URL("../", import.meta.url)), process.env.CLAUDE_CONFIG_DIR);
 	const ancestor = readFileSync(ancestorPath);
 
 	console.log("Triggering /compact...");

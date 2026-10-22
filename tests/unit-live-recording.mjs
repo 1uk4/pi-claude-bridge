@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { QueryContext } from "../src/query-state.js";
-import { LiveRecording } from "../src/session-sync.js";
+import { compareHistory, LiveRecording } from "../src/session-sync.js";
 import { digestMessage, digestMessages } from "../src/message-digests.js";
 const { __test } = await import("../src/index.js");
 const model = { api: "claude-bridge", provider: "claude-bridge", id: "claude-haiku-4-5", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
@@ -181,4 +181,63 @@ it("completed echoes after tool-result stream attachment only cover their origin
 	assert.deepEqual(c.turnBlocks, []);
 	assert.equal(c.currentPiStream, next);
 	assert.equal(c.lastAssistantMessageId, undefined);
+});
+
+it("overlapping identical user registrations cover one slot in either ack order, and repeated receipts are no-ops", () => {
+	for (const order of [["a", "b"], ["b", "a"]]) {
+		const live = new LiveRecording();
+		const messages = [user("prompt"), user("steer")];
+		live.users(messages.slice(0, 1), 0, "p", true);
+		live.users(messages, 1, "a", false);
+		live.users(messages, 1, "b", false);
+		live.acknowledge(order[0]);
+		assert.deepEqual(live.recorded.cuttable, [true, true]);
+		live.acknowledge(order[1]);
+		live.acknowledge(order[0]);
+		assert.deepEqual(live.recorded, { digests: digestMessages(messages), uuids: ["p", order[0]], cuttable: [true, false] });
+		assert.equal(compareHistory(digestMessages(messages), live.recorded).cutCount, 1, "the cut backs up before the copied run");
+		assert.equal(live.hasGaps, true, "CC holds a second copy no slot represents");
+		live.assistant(digestMessage(user("later")), [], "later");
+		assert.equal(live.recorded.digests.length, 2, "no later slot is covered past the duplicate");
+	}
+});
+
+it("a single receipt acknowledged twice records once and keeps coverage open", () => {
+	const live = new LiveRecording();
+	live.users([user("prompt")], 0, "p", false);
+	live.acknowledge("p");
+	live.acknowledge("p");
+	live.assistant("answer", [], "answer-uuid");
+	assert.deepEqual(live.recorded.uuids, ["p", "answer-uuid"]);
+	assert.deepEqual(live.recorded.cuttable, [true, true]);
+	assert.equal(live.hasGaps, false);
+});
+
+it("an old receipt never records changed content registered later at its index", () => {
+	const old = [user("original")], changed = [user("CHANGED")];
+	const live = new LiveRecording();
+	live.users(old, 0, "a", false);
+	live.users(changed, 0, "b", false);
+	live.acknowledge("a");
+	assert.deepEqual(live.recorded.digests, digestMessages(old));
+	assert.equal(compareHistory(digestMessages(changed), live.recorded).commonPrefix, 0);
+	const reverse = new LiveRecording();
+	reverse.users(old, 0, "a", false);
+	reverse.users(changed, 0, "b", false);
+	reverse.acknowledge("b");
+	assert.deepEqual(reverse.recorded.digests, [], "the new receipt cannot claim the old snapshot");
+	reverse.acknowledge("a");
+	assert.deepEqual(reverse.recorded.digests, [], "the old copy now duplicates consumed content");
+});
+
+it("re-registering an already covered index leaves history and pending slots untouched", () => {
+	const first = [user("prompt")];
+	const live = new LiveRecording();
+	live.users(first, 0, "p", true);
+	const recorded = structuredClone(live.recorded);
+	live.users([user("REWRITTEN"), user("steer")], 0, "s", false);
+	assert.deepEqual(live.recorded, recorded);
+	live.acknowledge("s");
+	assert.deepEqual(live.recorded, { ...recorded, cuttable: [false] }, "a receipt that re-sent covered content cannot extend coverage or keep its cut");
+	assert.equal(live.hasGaps, true);
 });

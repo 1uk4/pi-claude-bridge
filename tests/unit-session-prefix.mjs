@@ -1,6 +1,6 @@
 import { it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, appendFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, appendFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { QueryProcess } from "../src/query-process.js";
@@ -107,7 +107,7 @@ it("a changed suffix prompt conservatively drops its old @file expansion", () =>
 	assert.equal(openSession({ sessionId: synced.targetSessionId, projectPath: root }).attachments.length, 0);
 });
 
-it("c0 imports do not parse a malformed ancestor tail", () => {
+it("c0 imports ignore an uncommitted (unterminated) ancestor tail", () => {
 	const history = [user("SECRET"), say("answer")];
 	const { session } = seed(history);
 	appendFileSync(session.jsonlPath, '{"unfinished":');
@@ -115,6 +115,59 @@ it("c0 imports do not parse a malformed ancestor tail", () => {
 	const synced = sync([user("REDACTED"), history[1]]);
 	assert.notEqual(synced.targetSessionId, session.sessionId);
 	assert.deepEqual(readFileSync(session.jsonlPath), before);
+});
+
+it("row6 forks past an uncommitted final append without touching the source", () => {
+	const history = [user("a"), say("b")];
+	const { session, state } = seed(history);
+	state.dirtyTail = true;
+	appendFileSync(session.jsonlPath, '{"type":"assistant","uuid":"torn');
+	const before = readFileSync(session.jsonlPath);
+	assert.equal(sync(history).forkAt, state.uuids.at(-1));
+	assert.deepEqual(readFileSync(session.jsonlPath), before);
+});
+
+it("a malformed committed line fails, whether interior or final", () => {
+	for (const torn of ['{"unfinished":\n{"type":"summary"}\n', '{"unfinished":\n']) {
+		const history = [user("a"), say("b")];
+		const { session, state } = seed(history);
+		state.dirtyTail = true;
+		appendFileSync(session.jsonlPath, torn);
+		assert.throws(() => sync(history), SyntaxError);
+	}
+});
+
+it("c0 rewrites carry @file expansions of later unchanged prompts, for an early edit and a model change", () => {
+	const prompt = "review @fixture";
+	const history = [user("SECRET first"), say("answer"), user(prompt), say("later")];
+	const file = { type: "file", filename: "fixture", content: { type: "text", file: { filePath: "fixture", content: "fixture-bytes" } } };
+	for (const [messages, modelId] of [[[user("REDACTED first"), ...history.slice(1)], "sonnet"], [history, "opus"]]) {
+		const { session } = seed(history, [{ userOrdinal: 1, parentText: prompt, attachment: file }]);
+		const before = readFileSync(session.jsonlPath);
+		const synced = __test.syncSharedSession([...messages, user("next")], root, undefined, modelId, "pi");
+		assert.equal(synced.forkAt, undefined);
+		const rewritten = openSession({ sessionId: synced.targetSessionId, projectPath: root });
+		assert.deepEqual(rewritten.attachments.map((r) => r.attachment.filename), ["fixture"]);
+		assert.deepEqual(readFileSync(session.jsonlPath), before);
+	}
+});
+
+it("a symlinked cwd resolves the same transcript for reuse and fork, not a missing file", () => {
+	const real = join(root, "real"), link = join(root, "link");
+	mkdirSync(real);
+	symlinkSync(real, link);
+	const history = [user("a"), say("b")];
+	const session = createSession({ projectPath: real, model: "sonnet" });
+	const state = { ...importHistory(session, history), ccSessionId: session.sessionId, cwd: link, model: "sonnet", dirtyTail: false };
+	session.save();
+	__test.setSharedSession("pi", state);
+	const reuse = __test.syncSharedSession([...history, user("next")], link, undefined, "sonnet", "pi");
+	assert.equal(reuse.created, false);
+	assert.equal(reuse.sessionId, session.sessionId);
+	state.dirtyTail = true;
+	const fork = __test.syncSharedSession([...history, user("next")], link, undefined, "sonnet", "pi");
+	assert.equal(fork.sessionId, session.sessionId);
+	assert.equal(fork.forkAt, state.uuids.at(-1));
 });
 
 it("cut resolution accepts direct later-turn steer UUIDs and absorbed source_uuid attachments, never null", () => {

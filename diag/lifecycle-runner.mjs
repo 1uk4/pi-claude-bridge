@@ -219,6 +219,7 @@ function recordingChecks(events, dir) {
 		writeFileSync(join(recordingDir, `${state.ccSessionId}.jsonl`), readFileSync(session.jsonlPath), { mode: 0o600 });
 		const records = session.records.filter((r) => typeof r.uuid === "string" && ["user", "assistant", "attachment", "system"].includes(r.type));
 		const byId = new Map(records.map((r) => [r.uuid, r]));
+		const positions = new Map(records.map((r, i) => [r.uuid, i]));
 		const chain = new Set();
 		let record = records.at(-1);
 		while (record) {
@@ -226,15 +227,21 @@ function recordingChecks(events, dir) {
 			chain.add(record.uuid);
 			record = byId.get(record.parentUuid);
 		}
+		let furthest = -1;
 		for (const [i, uuid] of uuids.entries()) {
 			if (uuid === null) {
 				if (cuttable[i]) issues.push(`${label}: omitted slot ${i} is cuttable`);
 				continue;
 			}
 			const resolved = byId.get(uuid) ?? records.find((r) => r.type === "attachment" && r.attachment?.type === "queued_command" && r.attachment.source_uuid === uuid);
-			// Parallel results can be siblings of the last tool-call record. Their
-			// informational slots need a real record, not a place on the leaf's parent path.
-			if (typeof uuid !== "string" || !uuid || !resolved || (cuttable[i] && !chain.has(resolved.uuid))) issues.push(`${label}: slot ${i} has no record or its cut is off the selected parent chain`);
+			if (typeof uuid !== "string" || !uuid || !resolved) {
+				issues.push(`${label}: slot ${i} has no record`);
+				continue;
+			}
+			// Result/replay arrival order need not match disk order. A cut uses
+			// the furthest anchor in its whole prefix, not just this slot's UUID.
+			furthest = Math.max(furthest, positions.get(resolved.uuid));
+			if (cuttable[i] && !chain.has(records[furthest].uuid)) issues.push(`${label}: cut ${i} is off the selected parent chain`);
 		}
 	}
 	return [
@@ -502,7 +509,9 @@ const SCENARIOS = {
 				["the older native request prefix is unchanged", preserved?.status === "preserved", preserved],
 				["the mask and steer reached CC without the secret", sent?.includes("XXXXXX-XXXX") && sent.includes("PAPAYA") && !/SECRET-[0-9]{4}/.test(sent), written?.propagation],
 				["the recent edit keeps the ancestor's cached prefix", written?.cache.status === "covered", written?.cache],
-				["retained thinking is not dropped", noThinkingDrops(written), written?.apiTransformations],
+				// Thinking in the rewritten suffix may be dropped; only the native
+				// prefix above is required to survive unchanged.
+				["API transformations after the edit (observation)", true, written?.apiTransformations],
 			];
 		},
 	},

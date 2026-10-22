@@ -2,23 +2,31 @@
 import { it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createSession, getSessionPath } from "cc-session-io";
 import { digestMessages } from "../src/message-digests.js";
+import { loadSessionState, saveSessionState } from "../src/session-store.js";
+import { diagLogPath } from "../src/log-paths.js";
 const root = mkdtempSync(join(tmpdir(), "query-lifecycle-"));
 process.env.CLAUDE_CONFIG_DIR = root;
 process.on("exit", () => rmSync(root, { recursive: true, force: true }));
 const mod = await import("../src/index.js");
 const { __test } = mod;
 let provider;
-mod.default({ on: () => {}, registerProvider: (_id, value) => { provider = value; }, registerTool: () => {} });
+const handlers = {};
+mod.default({ on: (name, fn) => { (handlers[name] ??= []).push(fn); }, registerProvider: (_id, value) => { provider = value; }, registerTool: () => {} });
 const model = provider.models[0];
 const tools = [{ name: "read", description: "read", parameters: { type: "object", properties: {} } }];
 const user = (content) => ({ role: "user", content, timestamp: 1 });
 const toolResult = { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "file" }], timestamp: 1 };
-const call = (messages, signal) => provider.streamSimple(model, { messages, tools }, { sessionId: "pi", signal });
+const call = (messages, signal, sessionId = "pi", callModel = model) => provider.streamSimple(callModel, { messages, tools }, { sessionId, signal });
+const say = (text) => ({ role: "assistant", content: [{ type: "text", text }], provider: model.provider, timestamp: 1 });
+const sessionsDir = () => join(process.env.PI_CODING_AGENT_DIR, "claude-bridge", "sessions");
+const persisted = (id = "pi") => loadSessionState(id, assert.fail);
+const stored = ({ piSessionId, ...state }) => ({ ...state, dirtyTail: true });
 const tick = () => new Promise(setImmediate);
 let scripts, calls;
 
@@ -52,20 +60,25 @@ beforeEach(() => {
 			appendFileSync(path, JSON.stringify(value) + "\n");
 			return value;
 		};
-		const childCode = `const fs=require('fs'),crypto=require('crypto'); process.on('SIGTERM',()=>{setTimeout(()=>{if(${Boolean(script.late)}){const p=${JSON.stringify(path)};const r=fs.readFileSync(p,'utf8').trim().split('\\n').map(JSON.parse).filter(r=>r.uuid).at(-1);fs.appendFileSync(p,JSON.stringify({type:'attachment',uuid:crypto.randomUUID(),parentUuid:r.uuid,sessionId:${JSON.stringify(id)},attachment:{type:'interrupted',text:'late-exit-marker'}})+'\\n');}process.exit(0)},${script.late ? 60 : 0})});process.stdout.write('READY\\n');setInterval(()=>{},1000);`;
+		const childCode = `const fs=require('fs'),crypto=require('crypto'); process.on('SIGTERM',()=>{if(${Boolean(script.hang)})return;setTimeout(()=>{if(${Boolean(script.late)}){const p=${JSON.stringify(path)};const r=fs.readFileSync(p,'utf8').trim().split('\\n').map(JSON.parse).filter(r=>r.uuid).at(-1);fs.appendFileSync(p,JSON.stringify({type:'attachment',uuid:crypto.randomUUID(),parentUuid:r.uuid,sessionId:${JSON.stringify(id)},attachment:{type:'interrupted',text:'late-exit-marker'}})+'\\n');}process.exit(0)},${script.late ? 60 : 0})});process.stdout.write('READY\\n');setInterval(()=>{},1000);`;
 		const child = options.spawnClaudeCodeProcess({ command: process.execPath, args: ["-e", childCode], cwd: root, env: process.env, signal: new AbortController().signal });
 		const ready = once(child.stdout, "data");
 		const exited = once(child, "close");
 		let release, stopped = false;
 		const parked = new Promise((r) => { release = r; });
-		calls.push({ options, path, exited, child });
+		const entry = { options, path, exited, child };
+		calls.push(entry);
 		const gen = (async function* () {
 			await ready;
 			const input = typeof prompt === "string" ? null : prompt[Symbol.asyncIterator]();
 			const initial = input ? (await input.next()).value : { message: { content: prompt } };
 			if (input) void input.next().catch(() => {});
+			entry.pulled = true;
+			// CC pulled the prompt from stdin, then dies booting: no record, no replay.
+			if (script.boot) { await parked; return; }
 			record("user", initial.message.content, initial.uuid);
 			if (!script.preInit) yield { type: "system", subtype: "init", session_id: id };
+			if (!script.preInit && input) yield { type: "user", isReplay: true, parent_tool_use_id: null, uuid: initial.uuid, session_id: id, message: initial.message };
 			if (script.tool) {
 				const value = record("assistant", [{ type: "tool_use", id: "X", name: "mcp__custom-tools__read", input: {} }]);
 				yield { type: "assistant", parent_tool_use_id: null, uuid: value.uuid, message: { id: "tool-api", model: model.id, content: value.message.content } };
@@ -85,7 +98,7 @@ beforeEach(() => {
 });
 afterEach(async () => {
 	__test.setQuery(null);
-	for (const call of calls) if (!call.child.killed) call.child.kill("SIGTERM");
+	for (const call of calls) if (call.child.exitCode === null && call.child.signalCode === null) call.child.kill("SIGKILL");
 	await Promise.all(calls.map((c) => c.exited));
 	await tick();
 });
@@ -99,6 +112,7 @@ it("quota retries delete each new file only after the child finishes its late wr
 		const current = calls.at(-1);
 		assert.ok(existsSync(current.path), "iterator settlement must not delete a live child's file");
 		assert.equal(__test.getSharedSession("pi"), null);
+		assert.equal(persisted(), null, "a no-progress failure persists nothing");
 		await current.exited;
 		await tick();
 		assert.equal(existsSync(current.path), false, "cleanup follows actual exit, including late writes");
@@ -137,6 +151,7 @@ it("abort commits contiguous tool progress synchronously and waits for exit befo
 	assert.ok(captured, "onAbort synchronously publishes complete progress");
 	assert.equal(captured.dirtyTail, true);
 	assert.deepEqual(captured.digests, digestMessages([ask, tool]));
+	assert.deepEqual(persisted(), stored(captured), "abort progress is persisted synchronously");
 	scripts.push({});
 	const next = call([ask, tool, toolResult, user("continue")]);
 	await tick();
@@ -146,7 +161,8 @@ it("abort commits contiguous tool progress synchronously and waits for exit befo
 	assert.notEqual(calls[1].options.resume, captured.ccSessionId);
 	assert.match(readFileSync(calls[0].path, "utf8"), /late-exit-marker/);
 	assert.doesNotMatch(readFileSync(calls[1].path, "utf8"), /late-exit-marker/);
-	assert.equal(__test.getSharedSession("pi").ccSessionId, calls[1].options.sessionId);
+	assert.equal(calls[1].options.sessionId, undefined, "a prefix write resumes its own written id");
+	assert.equal(__test.getSharedSession("pi").ccSessionId, calls[1].options.resume);
 });
 
 it("a fresh same-session query discards a parked query and retains its progress under CAS", async () => {
@@ -160,7 +176,7 @@ it("a fresh same-session query discards a parked query and retains its progress 
 	assert.equal(__test.getSharedSession("pi").dirtyTail, true);
 	assert.deepEqual(__test.getSharedSession("pi").digests, digestMessages([ask, tool]));
 	await next.result();
-	assert.equal(__test.getSharedSession("pi").ccSessionId, calls[1].options.sessionId);
+	assert.equal(__test.getSharedSession("pi").ccSessionId, calls[1].options.resume);
 });
 
 
@@ -186,6 +202,7 @@ it("AskClaude forks the same model and imports a changed model without writing p
 	scripts.push({});
 	const answer = await call([ask]).result();
 	const state = __test.getSharedSession("pi");
+	const storedBefore = persisted();
 	await calls[0].exited;
 	const before = readFileSync(calls[0].path);
 	scripts.push({});
@@ -200,4 +217,224 @@ it("AskClaude forks the same model and imports a changed model without writing p
 	assert.notEqual(calls[2].options.resume, state.ccSessionId);
 	assert.strictEqual(__test.getSharedSession("pi"), state);
 	assert.deepEqual(readFileSync(calls[0].path), before);
+	assert.deepEqual(persisted(), storedBefore, "AskClaude never writes the provider's persisted state");
+	scripts.push({});
+	await __test.promptAndWait("no state", "none", new Map(), undefined, { model: model.id, appendSkills: false, context: [ask, answer], piSessionId: "pi-ask" });
+	assert.equal(calls[3].options.sessionId, undefined, "an imported session resumes its own written id");
+	assert.ok(calls[3].options.resume);
+	assert.equal(persisted("pi-ask"), null);
+});
+
+it("a restart reloads the persisted pointer dirty and forks at its last valid cut", async () => {
+	const ask = user("warm");
+	scripts.push({});
+	const answer = await call([ask]).result();
+	const saved = __test.getSharedSession("pi");
+	await calls[0].exited;
+	__test.forgetSessionMemory();
+	const loaded = __test.getSharedSession("pi");
+	assert.notStrictEqual(loaded, saved);
+	assert.deepEqual(loaded, { ...saved, dirtyTail: true });
+	scripts.push({});
+	await call([ask, answer, user("next")]).result();
+	assert.equal(calls[1].options.forkSession, true);
+	assert.equal(calls[1].options.resume, saved.ccSessionId);
+	assert.equal(calls[1].options.resumeSessionAt, saved.uuids.at(-1));
+	assert.equal(persisted().ccSessionId, calls[1].options.sessionId);
+	assert.equal(__test.getSharedSession("pi").dirtyTail, false);
+});
+
+it("a restart on another model imports pi's history instead of reusing the pointer", async () => {
+	const other = provider.models.find((m) => m.id !== model.id);
+	const ask = user("warm");
+	scripts.push({});
+	const answer = await call([ask]).result();
+	const saved = persisted();
+	await calls[0].exited;
+	__test.forgetSessionMemory();
+	scripts.push({});
+	await call([ask, answer, user("next")], undefined, "pi", other).result();
+	assert.equal(calls[1].options.forkSession, undefined);
+	assert.equal(calls[1].options.sessionId, undefined);
+	assert.notEqual(calls[1].options.resume, saved.ccSessionId);
+	assert.equal(persisted().ccSessionId, calls[1].options.resume);
+});
+
+it("a restart whose transcript is gone drops the persisted pointer and imports", async () => {
+	const ask = user("warm");
+	scripts.push({});
+	const answer = await call([ask]).result();
+	await calls[0].exited;
+	rmSync(calls[0].path);
+	__test.forgetSessionMemory();
+	scripts.push({ error: "API Error: quota exceeded" });
+	assert.equal((await call([ask, answer, user("next")]).result()).stopReason, "error");
+	assert.equal(calls[1].options.forkSession, undefined);
+	assert.ok(calls[1].options.resume, "pi's priors are written to a new session");
+	assert.equal(persisted(), null, "the missing transcript's pointer is deleted, not retained");
+	await calls[1].exited;
+});
+
+it("an invalid persisted file is rejected, logged, and treated as no state", async () => {
+	const ask = user("warm");
+	scripts.push({});
+	const answer = await call([ask]).result();
+	await calls[0].exited;
+	const [file] = readdirSync(sessionsDir());
+	writeFileSync(join(sessionsDir(), file), JSON.stringify({ ...JSON.parse(readFileSync(join(sessionsDir(), file), "utf8")), version: 2 }));
+	__test.forgetSessionMemory();
+	assert.equal(__test.getSharedSession("pi"), null);
+	assert.match(readFileSync(diagLogPath(), "utf8"), /session_state_rejected.*unsupported version/);
+	scripts.push({});
+	await call([ask, answer, user("next")]).result();
+	assert.equal(calls[1].options.forkSession, undefined);
+	assert.equal(persisted().ccSessionId, calls[1].options.resume);
+});
+
+it("an intentional null-uuid omission survives a restart", async () => {
+	const history = [user("a"), { role: "assistant", content: [], provider: model.provider, timestamp: 1 }, user("b")];
+	scripts.push({});
+	await call(history).result();
+	const saved = __test.getSharedSession("pi");
+	assert.equal(saved.uuids[1], null);
+	__test.forgetSessionMemory();
+	assert.deepEqual(__test.getSharedSession("pi"), { ...saved, dirtyTail: true });
+});
+
+it("a stale completion's CAS never overwrites the persisted replacement", async () => {
+	const controller = new AbortController();
+	scripts.push({ tool: true });
+	await call([user("tool")], controller.signal).result();
+	const replacement = { digests: [], uuids: [], cuttable: [], ccSessionId: "cc-replacement", cwd: root, model: "replacement-model", piSessionId: "pi", dirtyTail: false };
+	__test.setSharedSession("pi", replacement);
+	saveSessionState("pi", replacement);
+	controller.abort();
+	await calls[0].exited;
+	await tick();
+	assert.strictEqual(__test.getSharedSession("pi"), replacement);
+	assert.deepEqual(persisted(), stored(replacement));
+});
+
+it("an unattributed query never writes provider state", async () => {
+	scripts.push({});
+	await provider.streamSimple(model, { messages: [user("a"), say("b"), user("c")], tools }, {}).result();
+	await calls[0].exited;
+	assert.deepEqual(existsSync(sessionsDir()) ? readdirSync(sessionsDir()) : [], []);
+});
+
+it("switching pi sessions retains every other session's state", async () => {
+	scripts.push({});
+	await call([user("warm")]).result();
+	const saved = __test.getSharedSession("pi");
+	for (const reason of ["new", "resume", "fork"]) {
+		for (const fn of handlers.session_start) fn({ reason }, { cwd: process.cwd(), sessionManager: { getSessionId: () => `other-${reason}` } });
+	}
+	assert.strictEqual(__test.getSharedSession("pi"), saved);
+	assert.deepEqual(persisted(), stored(saved));
+});
+
+it("a prompt CC pulled but never replayed stays a gap, so a boot abort persists no absent anchor", async () => {
+	const ask = user("warm");
+	scripts.push({});
+	const answer = await call([ask]).result();
+	const saved = __test.getSharedSession("pi");
+	await calls[0].exited;
+	const controller = new AbortController(), booting = user("booting");
+	scripts.push({ boot: true });
+	const aborted = call([ask, answer, booting], controller.signal);
+	while (!calls[1]?.pulled) await tick();
+	assert.equal(calls[1].options.resume, saved.ccSessionId, "a plain resume appends to the saved file");
+	controller.abort();
+	assert.equal((await aborted.result()).stopReason, "aborted");
+	assert.deepEqual(persisted(), stored(saved), "only the old valid prefix is retained");
+	const placeholder = { role: "assistant", content: [{ type: "text", text: "" }], provider: model.provider, stopReason: "aborted", timestamp: 1 };
+	scripts.push({});
+	assert.equal((await call([ask, answer, booting, placeholder, user("again")]).result()).stopReason, "stop");
+	assert.equal(calls[2].options.forkSession, undefined);
+	assert.notEqual(calls[2].options.resume, saved.ccSessionId, "the unpersisted prompt is rewritten after the old cut");
+	const state = __test.getSharedSession("pi");
+	const records = readFileSync(getSessionPath(state.ccSessionId, state.cwd, root), "utf8");
+	for (const uuid of state.uuids) if (uuid) assert.match(records, new RegExp(uuid));
+});
+
+it("a healthy parked provider query does not block a readonly AskClaude fork", { timeout: 5000 }, async () => {
+	const ask = user("warm");
+	scripts.push({});
+	const answer = await call([ask]).result();
+	const saved = __test.getSharedSession("pi");
+	await calls[0].exited;
+	scripts.push({ tool: true });
+	await call([ask, answer, user("tool")]).result();
+	assert.equal(calls[1].options.resume, saved.ccSessionId, "the parked query appends to the saved file");
+	const [parked] = __test.activeQueryContexts;
+	scripts.push({});
+	const reply = await __test.promptAndWait("delegated", "none", new Map(), undefined, { model: model.id, appendSkills: false, context: [ask, answer], piSessionId: "pi" });
+	assert.equal(reply.responseText, "answer");
+	assert.equal(calls[2].options.forkSession, true);
+	assert.equal(calls[2].options.resume, saved.ccSessionId);
+	assert.equal(calls[2].options.resumeSessionAt, saved.uuids.at(-1));
+	assert.equal(parked.discarded, false);
+	assert.ok(__test.activeQueryContexts.has(parked));
+	assert.equal(calls[1].child.exitCode, null, "the parked child keeps running");
+	assert.strictEqual(__test.getSharedSession("pi"), saved);
+});
+
+it("an abort cancels a fresh query's wait on a stopping writer", { timeout: 5000 }, async () => {
+	const controller = new AbortController(), ask = user("tool");
+	scripts.push({ tool: true, hang: true });
+	const tool = await call([ask], controller.signal).result();
+	controller.abort();
+	const state = __test.getSharedSession("pi");
+	assert.equal(state.ccSessionId, calls[0].options.sessionId);
+	const next = new AbortController();
+	const waiting = call([ask, tool, toolResult, user("next")], next.signal);
+	await tick();
+	next.abort();
+	assert.equal((await waiting.result()).stopReason, "aborted");
+	assert.equal(calls.length, 1, "nothing launched while the old child is still stopping");
+	assert.deepEqual(__test.getSharedSession("pi"), state);
+	calls[0].child.kill("SIGKILL");
+	await calls[0].exited;
+});
+
+it("a failed state save ends the turn with that error and is fatal, never retried as a query failure", async () => {
+	// The surfaced rejection must kill the process, so the scenario runs in a child.
+	const script = `
+		import { createHash } from "node:crypto";
+		import { mkdirSync } from "node:fs";
+		import { join } from "node:path";
+		const mod = await import(${JSON.stringify(new URL("../src/index.ts", import.meta.url).href)});
+		let provider;
+		mod.default({ on() {}, registerProvider: (_id, value) => { provider = value; }, registerTool() {} });
+		const model = provider.models[0];
+		mod.__test.getSharedSession("pi");
+		const file = "s-" + createHash("sha256").update("pi", "utf16le").digest("hex") + ".json";
+		mkdirSync(join(process.env.PI_CODING_AGENT_DIR, "claude-bridge", "sessions", file, "occupied"), { recursive: true });
+		mod.__test.setQuery(({ prompt, options }) => {
+			const gen = (async function* () {
+				const initial = (await prompt[Symbol.asyncIterator]().next()).value;
+				yield { type: "system", subtype: "init", session_id: options.sessionId };
+				yield { type: "user", isReplay: true, parent_tool_use_id: null, uuid: initial.uuid, message: initial.message };
+				yield { type: "assistant", parent_tool_use_id: null, uuid: "answer-uuid", message: { id: "answer", model: model.id, content: [{ type: "text", text: "answer" }] } };
+				yield { type: "result", subtype: "success", is_error: false, result: "answer", session_id: options.sessionId };
+			})();
+			gen.interrupt = async () => {};
+			gen.close = () => {};
+			return gen;
+		});
+		const output = await provider.streamSimple(model, { messages: [{ role: "user", content: "hi", timestamp: 1 }], tools: [] }, { sessionId: "pi" }).result();
+		console.log(JSON.stringify({ stopReason: output.stopReason, errorMessage: output.errorMessage }));
+		setTimeout(() => console.log("survived"), 200);
+	`;
+	const child = spawn(process.execPath, ["--import", "tsx", "--import", "./tests/lib/setup.mjs", "--input-type=module", "-e", script], { stdio: ["ignore", "pipe", "pipe"] });
+	let stdout = "", stderr = "";
+	child.stdout.on("data", (d) => { stdout += d; });
+	child.stderr.on("data", (d) => { stderr += d; });
+	const [code] = await once(child, "close");
+	const lines = stdout.trim().split("\n");
+	assert.deepEqual(JSON.parse(lines[0]).stopReason, "error", stdout + stderr);
+	assert.match(JSON.parse(lines[0]).errorMessage, /EISDIR/);
+	assert.notEqual(code, 0, "the failed save is not swallowed");
+	assert.ok(!lines.includes("survived"));
+	assert.match(stderr, /EISDIR/);
 });

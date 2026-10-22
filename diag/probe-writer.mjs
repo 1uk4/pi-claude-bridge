@@ -72,6 +72,8 @@ const CONTINUATION = "Without using any tools, reply with exactly one word: cont
 // As src/index.ts (CLAUDE_MD_EXCLUDES is module-private there).
 const CLAUDE_MD_EXCLUDES = ["**/CLAUDE.md", "**/AGENTS.md", "**/.claude/rules/**"];
 process.env.CLAUDE_BRIDGE_TEST_LOG_DIR ??= join(OUT, "logs");
+// The parent-side bridge helpers use the same isolated state as the child.
+process.env.PI_CODING_AGENT_DIR = join(OUT, "agent");
 const { createRpcHarness } = await import("../tests/lib/rpc-harness.mjs");
 const { __test: bridge } = await import("../src/index.js");
 

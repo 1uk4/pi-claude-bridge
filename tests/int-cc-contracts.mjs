@@ -537,7 +537,7 @@ test("--thinking-display summarized is still an accepted flag value", { timeout:
  *  Lets a contract assert on the exact request CC builds, at zero API cost.
  *  `paths` records every request line; `overloadFirst` answers that many
  *  /v1/messages posts with a 529 first, which CC retries. */
-function stubApi(requests, { paths, overloadFirst = 0, toolCallsFirst = [] } = {}) {
+function stubApi(requests, { paths, overloadFirst = 0, toolCallsFirst = [], stall = false } = {}) {
 	const server = createServer((req, res) => {
 		const chunks = [];
 		paths?.push(`${req.method} ${req.url}`);
@@ -557,9 +557,11 @@ function stubApi(requests, { paths, overloadFirst = 0, toolCallsFirst = [] } = {
 					event("content_block_start", { type: "content_block_start", index, content_block: block })
 					+ event("content_block_delta", { type: "content_block_delta", index, delta: block.type === "tool_use" ? { type: "input_json_delta", partial_json: "{}" } : { type: "text_delta", text: "OK" } })
 					+ event("content_block_stop", { type: "content_block_stop", index })).join("");
+				const start = event("message_start", { type: "message_start", message: { id: `msg_stub_${requests.length}`, type: "message", role: "assistant", content: [], model: body.model, stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } } });
 				res.writeHead(200, { "content-type": "text/event-stream" });
+				if (stall) { res.write(start + contentEvents); return; }
 				res.end(
-					event("message_start", { type: "message_start", message: { id: `msg_stub_${requests.length}`, type: "message", role: "assistant", content: [], model: body.model, stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } } })
+					start
 					+ event("ping", { type: "ping" })
 					+ contentEvents
 					+ event("message_delta", { type: "message_delta", delta: { stop_reason: tools.length ? "tool_use" : "end_turn", stop_sequence: null }, usage: { output_tokens: 1 } })
@@ -674,10 +676,11 @@ test("a steer replayed after a completed turn has its own user record after that
 	const cwd = mkdtempSync(join(tmpdir(), "cc-late-steer-"));
 	const sessionId = randomUUID();
 	const steerUuid = randomUUID();
+	const promptUuid = randomUUID();
 	let release;
 	const completed = new Promise((resolve) => { release = resolve; });
 	async function* prompts() {
-		yield { type: "user", message: { role: "user", content: "Reply OK to FIRST-TURN." }, parent_tool_use_id: null, uuid: randomUUID() };
+		yield { type: "user", message: { role: "user", content: "Reply OK to FIRST-TURN." }, parent_tool_use_id: null, uuid: promptUuid };
 		await completed;
 		yield { type: "user", message: { role: "user", content: "Reply OK to LATE-STEER." }, parent_tool_use_id: null, uuid: steerUuid, priority: "next" };
 	}
@@ -696,12 +699,15 @@ test("a steer replayed after a completed turn has its own user record after that
 			if (message.type === "result") { assert.equal(message.subtype, "success"); if (++results === 1) release(); }
 		}
 		assert.equal(results, 2, "both turns must complete");
+		assert.ok(messages.some((m) => m.type === "user" && m.isReplay && m.uuid === promptUuid), "CC must replay-acknowledge the initial supplied UUID");
 		const firstAssistant = messages.find((m) => m.type === "assistant");
 		const replay = messages.find((m) => m.type === "user" && m.isReplay && m.uuid === steerUuid);
 		assert.ok(firstAssistant && replay, "the late steer must be replay-acknowledged");
 		assert.ok(messages.indexOf(firstAssistant) < messages.indexOf(replay));
 		const session = openSession({ sessionId, projectPath: cwd, claudeDir: process.env.CLAUDE_CONFIG_DIR });
 		const firstAt = session.records.findIndex((r) => r.uuid === firstAssistant.uuid);
+		const promptAt = session.records.findIndex((r) => r.uuid === promptUuid);
+		assert.ok(promptAt >= 0 && promptAt < firstAt, "initial replay UUID must name the recorded prompt");
 		const steerAt = session.records.findIndex((r) => r.uuid === steerUuid);
 		assert.ok(firstAt >= 0 && steerAt > firstAt, "late steer must follow the already completed assistant");
 		assert.equal(session.records[steerAt].type, "user", "a later-turn steer is a user record, not a queued_command attachment");
@@ -711,6 +717,62 @@ test("a steer replayed after a completed turn has its own user record after that
 		api.close();
 		rmSync(getProjectDir(cwd, process.env.CLAUDE_CONFIG_DIR), { recursive: true, force: true });
 		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
+test("an initial replay's prompt UUID survives abort once the real child exits", { timeout: 120_000 }, async () => {
+	const requests = [];
+	const api = await stubApi(requests, { stall: true });
+	const cwd = mkdtempSync(join(tmpdir(), "cc-prompt-replay-abort-"));
+	const source = createSession({ projectPath: cwd, claudeDir: process.env.CLAUDE_CONFIG_DIR, model: MODEL });
+	source.addUserMessage("Remember the old prefix.");
+	source.addAssistantMessage([{ type: "text", text: "Remembered." }]);
+	source.save();
+	const promptUuid = randomUUID();
+	let release, resolveExit, replayed = false;
+	const held = new Promise((resolve) => { release = resolve; });
+	const exited = new Promise((resolve) => { resolveExit = resolve; });
+	async function* prompt() {
+		yield { type: "user", message: { role: "user", content: "Replay this prompt before answering." }, parent_tool_use_id: null, uuid: promptUuid };
+		await held;
+	}
+	const q = query({ prompt: prompt(), options: providerOptions({
+		cwd, resume: source.sessionId, includePartialMessages: true,
+		extraArgs: { "strict-mcp-config": null, "replay-user-messages": null },
+		spawnClaudeCodeProcess(options) {
+			const child = spawn(options.command, options.args, { cwd: options.cwd, env: options.env, signal: options.signal, stdio: ["pipe", "pipe", "pipe"] });
+			child.stderr.on("data", () => {});
+			child.once("close", resolveExit);
+			return child;
+		},
+		env: { ...process.env, ANTHROPIC_BASE_URL: api.url, ENABLE_CLAUDEAI_MCP_SERVERS: "0", DISABLE_AUTO_COMPACT: "1", CLAUDE_CODE_ELEGANT_MEADOW: "0" },
+	}) });
+	const watchdog = setTimeout(() => { release(); q.close(); }, 15_000);
+	try {
+		for await (const message of q) {
+			if (message.type === "user" && message.isReplay && message.uuid === promptUuid) {
+				replayed = true;
+				release();
+				void q.interrupt().catch(() => {});
+				q.close();
+				break;
+			}
+		}
+		assert.ok(replayed, "CC must acknowledge the supplied initial prompt UUID");
+	} finally {
+		clearTimeout(watchdog);
+		q.close();
+		release();
+		await exited;
+		try {
+			// A replay proves consumption, not an immediate disk flush.
+			const saved = openSession({ sessionId: source.sessionId, projectPath: cwd, claudeDir: process.env.CLAUDE_CONFIG_DIR });
+			assert.ok(saved.records.some((r) => r.uuid === promptUuid), "replayed prompt must be written by real process exit");
+		} finally {
+			api.close();
+			rmSync(getProjectDir(cwd, process.env.CLAUDE_CONFIG_DIR), { recursive: true, force: true });
+			rmSync(cwd, { recursive: true, force: true });
+		}
 	}
 });
 

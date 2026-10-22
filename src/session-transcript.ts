@@ -1,8 +1,8 @@
 // CC's loader recovers parallel siblings by API message id and tool-use id,
 // not just parentUuid (2.1.308: bDt -> Zuo). Keep the physical prefix, including
 // siblings, snapshots and attachments; bridge changes always mint a fresh file.
-import { getSessionPath, parseJsonlFile, type JsonlRecord, type Session } from "cc-session-io";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { getSessionPath, parseJsonl, type JsonlRecord, type Session } from "cc-session-io";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { validateRecording, type Recording, type SessionState } from "./session-sync.js";
 
@@ -10,8 +10,18 @@ const AUDIT = new Set(["api-request", "api-request-shape", "api-request-blob"]);
 type RecordEntry = JsonlRecord & { uuid?: string; parentUuid?: string | null; attachment?: { type: string; source_uuid?: string } };
 const chainEntry = (record: RecordEntry): boolean => ["user", "assistant", "attachment", "system"].includes(record.type) && typeof record.uuid === "string" && (typeof record.parentUuid === "string" || record.parentUuid === null);
 
+/** A record is committed by its terminating newline. Every terminated line
+ * parses strictly; only an unterminated final line that fails to parse is an
+ * append a crash cut short, and is not part of the transcript. */
 export function readTranscript(state: Pick<SessionState, "ccSessionId" | "cwd">): RecordEntry[] {
-	return parseJsonlFile(getSessionPath(state.ccSessionId, state.cwd, process.env.CLAUDE_CONFIG_DIR)).filter((r) => !AUDIT.has(r.type)) as RecordEntry[];
+	const text = readFileSync(getSessionPath(state.ccSessionId, state.cwd, process.env.CLAUDE_CONFIG_DIR), "utf8");
+	const end = text.lastIndexOf("\n") + 1;
+	const records = parseJsonl(text.slice(0, end));
+	if (text.slice(end).trim()) {
+		try { records.push(JSON.parse(text.slice(end))); }
+		catch (error) { if (!(error instanceof SyntaxError)) throw error; }
+	}
+	return records.filter((r) => !AUDIT.has(r.type)) as RecordEntry[];
 }
 
 function boundaryIndex(records: readonly RecordEntry[], uuid: string | null): number {

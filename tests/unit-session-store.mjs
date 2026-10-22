@@ -3,7 +3,7 @@
 
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { deleteSessionState, loadSessionState, saveSessionState } from "../src/session-store.js";
@@ -83,6 +83,21 @@ describe("session state persistence", () => {
 			assert.equal(rejected.length, 1, reason);
 			assert.match(rejected[0], new RegExp(reason.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), reason);
 		}
+	});
+
+	it("rejects an object version without converting it", () => {
+		const file = sessionFile("object-version");
+		writeFileSync(file, JSON.stringify({ ...validFile(), version: { toString: "hostile", valueOf: "hostile" } }));
+		const rejected = [];
+		assert.equal(loadSessionState("object-version", (message) => rejected.push(message)), null);
+		assert.deepEqual(rejected, ["Rejected persisted Claude session state: unsupported version; expected 1"]);
+	});
+
+	it("surfaces read errors other than a missing file", () => {
+		const file = sessionFile("directory");
+		rmSync(file);
+		mkdirSync(file);
+		assert.throws(() => loadSessionState("directory", assert.fail), { code: "EISDIR" });
 	});
 
 	it("rejects empty session pointers on save", () => {

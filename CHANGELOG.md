@@ -2,7 +2,7 @@
 
 ## UNRELEASED
 
-- **Fix: preserve matching conversation history (#222)** -- Detect content edits and retain matching Claude Code records through rewinds and interruptions.
+- **Fix: preserve matching conversation history (#222)** — Detect content edits and retain matching Claude Code records through rewinds, interruptions and restarts.
 
 - **Fix: queued steering keeps MCP input open through later turns (#172)** — Keep Claude Code's input open until each steer is replayed into a turn, then close after that turn completes. An error result still ends the query, so a steer Claude Code had queued can no longer run on and replace the failure.
 

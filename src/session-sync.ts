@@ -20,16 +20,19 @@ export interface SessionState extends Recording {
 	dirtyTail: boolean;
 }
 
+/** A recording that breaks the slot invariants; persisted state rejects only this. */
+export class InvalidRecordingError extends Error {}
+
 export function validateRecording(recorded: Recording): void {
 	if (!Array.isArray(recorded.digests) || !Array.isArray(recorded.uuids) || !Array.isArray(recorded.cuttable)
 		|| recorded.digests.length !== recorded.uuids.length || recorded.digests.length !== recorded.cuttable.length) {
-		throw new Error("Session recording arrays must be present and aligned");
+		throw new InvalidRecordingError("Session recording arrays must be present and aligned");
 	}
 	for (let i = 0; i < recorded.digests.length; i++) {
 		const uuid = recorded.uuids[i];
 		if (typeof recorded.digests[i] !== "string" || typeof recorded.cuttable[i] !== "boolean"
 			|| (uuid !== null && (typeof uuid !== "string" || !uuid.length)) || (uuid === null && recorded.cuttable[i])) {
-			throw new Error(`Invalid session recording slot ${i}`);
+			throw new InvalidRecordingError(`Invalid session recording slot ${i}`);
 		}
 	}
 }
@@ -114,10 +117,18 @@ interface LiveSlot { digest: string; uuid?: string; toolCalls: string[]; resultI
 export class LiveRecording {
 	readonly recorded: Recording;
 	private slots = new Map<number, LiveSlot>();
-	private steers = new Map<string, { indexes: number[]; unsafe: boolean; steering: boolean }>();
+	private steers = new Map<string, { first: number; bound: { index: number; slot: LiveSlot }[]; overlaps: boolean; unsafe: boolean; steering: boolean }>();
 	private progress = 0;
+	/** CC consumed a second copy of pi content, so its file holds a record no pi
+	 * slot represents. Receipt order is not disk order, so every cut from the
+	 * copied run on may retain it; only earlier cuts stay valid. */
+	private duplicated = false;
+	private duplicate(first: number): void {
+		this.duplicated = true;
+		for (let i = first; i < this.recorded.cuttable.length; i++) this.recorded.cuttable[i] = false;
+	}
 	get hasProgress(): boolean { return this.progress > 0; }
-	get hasGaps(): boolean { return this.nextIndex > this.recorded.digests.length; }
+	get hasGaps(): boolean { return this.duplicated || this.nextIndex > this.recorded.digests.length; }
 	gap(): void { this.nextIndex++; }
 	/** A later-turn steer follows output pi merges into its next assistant.
 	 * Cutting at that steer would keep the unrepresented earlier output twice. */
@@ -133,25 +144,44 @@ export class LiveRecording {
 		this.nextIndex = this.recorded.digests.length;
 		for (const message of messages.slice(0, this.nextIndex)) updatePendingTools(this.outstanding, message);
 	}
+	/** A receipt binds to the exact slots it delivered. An index already covered,
+	 * or pending with other content, keeps its first snapshot; an identical
+	 * pending slot is shared, and whichever receipt is acknowledged first owns it. */
 	users(messages: PiMessage[], start: number, uuid: string, acknowledged: boolean, steering = !acknowledged): void {
-		const indexes: number[] = [];
+		const bound: { index: number; slot: LiveSlot }[] = [];
+		let overlaps = false, first = messages.length;
 		for (let i = start; i < messages.length; i++) {
 			if (messages[i].role !== "user") continue;
-			this.slots.set(i, { digest: digestMessage(messages[i]), ...(acknowledged ? { uuid } : {}), toolCalls: [] });
-			indexes.push(i);
+			first = Math.min(first, i);
+			const digest = digestMessage(messages[i]);
+			const existing = this.slots.get(i);
+			if (i < this.recorded.digests.length || (existing && (existing.digest !== digest || existing.uuid))) overlaps = true;
+			else if (existing) bound.push({ index: i, slot: existing });
+			else {
+				const slot: LiveSlot = { digest, toolCalls: [] };
+				this.slots.set(i, slot);
+				bound.push({ index: i, slot });
+			}
 		}
 		this.nextIndex = Math.max(this.nextIndex, messages.length);
-		if (!acknowledged) this.steers.set(uuid, { indexes, unsafe: false, steering });
-		this.flush();
+		this.steers.set(uuid, { first, bound, overlaps, unsafe: false, steering });
+		if (acknowledged) this.acknowledge(uuid);
+		else this.flush();
 	}
+	/** Repeated or unknown receipts are no-ops. */
 	acknowledge(uuid: string): void {
 		const steer = this.steers.get(uuid);
-		for (const i of steer?.indexes ?? []) {
-			const slot = this.slots.get(i)!;
-			slot.uuid = uuid;
-			slot.nonCuttable = steer!.unsafe;
-		}
+		if (!steer) return;
 		this.steers.delete(uuid);
+		if (steer.overlaps) this.duplicate(steer.first);
+		for (const { index, slot } of steer.bound) {
+			if (this.slots.get(index) !== slot || slot.uuid) {
+				this.duplicate(steer.first);
+				continue;
+			}
+			slot.uuid = uuid;
+			slot.nonCuttable = steer.unsafe;
+		}
 		this.flush();
 	}
 	assistant(digest: string, toolCalls: string[], uuid?: string, resetTools = true): number {
@@ -180,7 +210,7 @@ export class LiveRecording {
 		this.flush();
 	}
 	private flush(): void {
-		while (true) {
+		while (!this.duplicated) {
 			const i = this.recorded.digests.length;
 			const slot = this.slots.get(i);
 			if (!slot?.uuid) break;

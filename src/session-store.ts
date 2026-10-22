@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { validateRecording, type Recording } from "./session-sync.js";
+import { InvalidRecordingError, validateRecording, type Recording } from "./session-sync.js";
 
 const FORMAT_VERSION = 1;
 
@@ -50,7 +50,7 @@ export function loadSessionState(piSessionId: string, onReject: (message: string
 	if (value === null || typeof value !== "object" || Array.isArray(value)) return reject(onReject, "expected an object");
 	const stored = value as Record<string, unknown>;
 	if (!("version" in stored)) return reject(onReject, "missing version");
-	if (stored.version !== FORMAT_VERSION) return reject(onReject, `unsupported version ${String(stored.version)}`);
+	if (stored.version !== FORMAT_VERSION) return reject(onReject, `unsupported version; expected ${FORMAT_VERSION}`);
 	for (const key of ["ccSessionId", "cwd", "model", "digests", "uuids", "cuttable"] as const) {
 		if (!(key in stored)) return reject(onReject, `missing ${key}`);
 	}
@@ -64,9 +64,7 @@ export function loadSessionState(piSessionId: string, onReject: (message: string
 	try {
 		validateRecording({ digests: stored.digests as string[], uuids: stored.uuids as (string | null)[], cuttable: stored.cuttable as boolean[] });
 	} catch (error) {
-		if (error instanceof Error && (error.message === "Session recording arrays must be present and aligned" || /^Invalid session recording slot \d+$/.test(error.message))) {
-			return reject(onReject, error.message);
-		}
+		if (error instanceof InvalidRecordingError) return reject(onReject, error.message);
 		throw error;
 	}
 	return {
