@@ -203,6 +203,9 @@ const noThinkingDrops = (transition) => !(transition?.apiTransformations ?? []).
 function recordingChecks(events, dir) {
 	const states = events.filter((e) => e.type === "session-recorded" && e.source !== "import");
 	const issues = [];
+	const lastQuery = events.findLast((e) => e.type === "query-start" && e.kind === "provider");
+	const end = events.findLast((e) => e.type === "query-end" && e.queryId === lastQuery?.queryId);
+	const result = events.findLast((e) => e.type === "query-result" && e.queryId === lastQuery?.queryId);
 	for (const state of states) {
 		const label = `${state.queryId}/${state.ccSessionId}`;
 		const { digests, uuids, cuttable } = state;
@@ -235,6 +238,7 @@ function recordingChecks(events, dir) {
 		}
 	}
 	return [
+		["the final provider query completed successfully", end?.outcome === "complete" && result?.subtype === "success" && !result.isError, { end, result }],
 		["completed queries recorded their covered pi prefixes", states.length > 0, states.length],
 		["recorded UUIDs resolve; only selected-chain boundaries can be cut", issues.length === 0, issues],
 	];
@@ -405,7 +409,9 @@ const SCENARIOS = {
 			const h = await ctx.pi();
 			await prompt(h, "Please look up the key alpha with the lc_lookup tool and tell me its value.");
 			await extraTurns(h);
-			ctx.armFault({ status: 400, count: 1, match: "tool-result", body: { type: "error", error: { type: "invalid_request_error", message: "Injected by capture-proxy" } } });
+			// CC retries a generic 400 once without deferred tools. Reject that
+			// recovery too so this scenario reaches the bridge's failure path.
+			ctx.armFault({ status: 400, count: 2, match: "tool-result", headers: { "x-should-retry": "false" }, body: { type: "error", error: { type: "invalid_request_error", message: "Injected by capture-proxy" } } });
 			await prompt(h, "Thanks. Now look up the key beta.");
 			ctx.armFault({ count: 0 });
 			await prompt(h, "Let's try again: look up the key gamma.");
@@ -416,7 +422,7 @@ const SCENARIOS = {
 			const atBoundary = analysis.transitions.some((t) => t.to.kind === "tool-result" && (t.to.request === injected[0]?.n || t.to.attempts?.some((a) => a.n === injected[0]?.n)));
 			const failed = events.find((e) => e.type === "query-end" && e.outcome === "error") ?? events.find((e) => e.type === "query-result" && e.isError);
 			return [
-				["one injected error, at the tool boundary", injected.length === 1 && atBoundary, injected.map((r) => r.n)],
+				["the tool-boundary request and deferred-tool recovery were rejected", injected.length === 2 && atBoundary, injected.map((r) => r.n)],
 				["the query reported the failure", Boolean(failed), failed],
 				["recovery keeps the covered prefix instead of losing the mirror", [6, 7].includes(decisions.at(-1)?.row) && decisions.at(-1)?.cutCount > 0, decisions.at(-1)],
 			];
