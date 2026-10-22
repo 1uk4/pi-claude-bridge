@@ -59,8 +59,9 @@ const OUT = flag("out") ?? mkdtempSync(join(tmpdir(), "prompt-recording-"));
 const CLAUDE_DIR = process.env.CLAUDE_CONFIG_DIR;
 
 // The claude_code preset's own anchor. CC's title/summary side requests share no
-// prefix with it, so this selects the agent-loop requests from a capture.
-const PRESET_ANCHOR = "You are an interactive agent";
+// prefix with it, so this selects the agent-loop requests from a capture. Not
+// the intro line: its wording changed in 2.1.308, while this one is in both.
+const PRESET_ANCHOR = "IMPORTANT: Assist with authorized security testing";
 
 const runTag = randomUUID().slice(0, 8);
 const MARK = { one: `MARKER-ONE-${runTag}`, two: `MARKER-TWO-${runTag}` };
