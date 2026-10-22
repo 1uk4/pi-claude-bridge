@@ -1,0 +1,203 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "content": [
+    {
+     "type": "text",
+     "text": "Please look up the key alpha with the lc_lookup tool and tell me its value."
+    }
+   ],
+   "timestamp": 1792623689193
+  },
+  {
+   "role": "assistant",
+   "content": [
+    {
+     "type": "toolCall",
+     "id": "toolu_01DCe5fCSkKCe3B4WEVgb9E2",
+     "name": "lc_lookup",
+     "arguments": {
+      "key": "alpha"
+     }
+    }
+   ],
+   "api": "claude-bridge",
+   "provider": "claude-bridge",
+   "model": "claude-haiku-5-5",
+   "usage": {
+    "input": 2,
+    "output": 62,
+    "cacheRead": 3773,
+    "cacheWrite": 348,
+    "totalTokens": 4185,
+    "cost": {
+     "input": 0,
+     "output": 0,
+     "cacheRead": 0,
+     "cacheWrite": 0,
+     "total": 0
+    },
+    "reasoning": 0
+   },
+   "stopReason": "toolUse",
+   "timestamp": 1792623689215,
+   "durationMs": 1177,
+   "thinkingLevel": "medium"
+  },
+  {
+   "role": "toolResult",
+   "toolCallId": "toolu_01DCe5fCSkKCe3B4WEVgb9E2",
+   "toolName": "lc_lookup",
+   "content": [
+    {
+     "type": "text",
+     "text": "record alpha: value-5"
+    }
+   ],
+   "isError": false,
+   "durationMs": 0,
+   "timestamp": 1792623690393
+  },
+  {
+   "role": "assistant",
+   "content": [
+    {
+     "type": "text",
+     "text": "The value for the key `alpha` is `value-5`."
+    }
+   ],
+   "api": "claude-bridge",
+   "provider": "claude-bridge",
+   "model": "claude-haiku-5-5",
+   "usage": {
+    "input": 2,
+    "output": 19,
+    "cacheRead": 4121,
+    "cacheWrite": 99,
+    "totalTokens": 4241,
+    "cost": {
+     "input": 0,
+     "output": 0,
+     "cacheRead": 0,
+     "cacheWrite": 0,
+     "total": 0
+    },
+    "reasoning": 0
+   },
+   "stopReason": "stop",
+   "timestamp": 1792623690395,
+   "durationMs": 680,
+   "thinkingLevel": "medium"
+  },
+  {
+   "role": "user",
+   "content": [
+    {
+     "type": "text",
+     "text": "Thanks. Now look up the key beta with lc_lookup."
+    }
+   ],
+   "timestamp": 1792623691076
+  },
+  {
+   "role": "assistant",
+   "content": [
+    {
+     "type": "toolCall",
+     "id": "toolu_015X5nBBMTpJU76nbJN7Wh8v",
+     "name": "lc_lookup",
+     "arguments": {
+      "key": "beta"
+     }
+    }
+   ],
+   "api": "claude-bridge",
+   "provider": "claude-bridge",
+   "model": "claude-haiku-5-5",
+   "usage": {
+    "input": 2,
+    "output": 61,
+    "cacheRead": 4220,
+    "cacheWrite": 67,
+    "totalTokens": 4350,
+    "cost": {
+     "input": 0,
+     "output": 0,
+     "cacheRead": 0,
+     "cacheWrite": 0,
+     "total": 0
+    },
+    "reasoning": 0
+   },
+   "stopReason": "toolUse",
+   "timestamp": 1792623691077,
+   "durationMs": 1683,
+   "thinkingLevel": "medium"
+  },
+  {
+   "role": "toolResult",
+   "toolCallId": "toolu_015X5nBBMTpJU76nbJN7Wh8v",
+   "toolName": "lc_lookup",
+   "content": [
+    {
+     "type": "text",
+     "text": "record beta: value-4"
+    }
+   ],
+   "isError": false,
+   "durationMs": 0,
+   "timestamp": 1792623692761
+  },
+  {
+   "role": "assistant",
+   "content": [
+    {
+     "type": "text",
+     "text": "The value for the key `beta` is `value-4`."
+    }
+   ],
+   "api": "claude-bridge",
+   "provider": "claude-bridge",
+   "model": "claude-haiku-5-5",
+   "usage": {
+    "input": 2,
+    "output": 18,
+    "cacheRead": 4287,
+    "cacheWrite": 97,
+    "totalTokens": 4404,
+    "cost": {
+     "input": 0,
+     "output": 0,
+     "cacheRead": 0,
+     "cacheWrite": 0,
+     "total": 0
+    },
+    "reasoning": 0
+   },
+   "stopReason": "stop",
+   "timestamp": 1792623692762,
+   "durationMs": 567,
+   "thinkingLevel": "medium"
+  },
+  {
+   "role": "user",
+   "content": [
+    {
+     "type": "text",
+     "text": "Great. Just say goodbye."
+    }
+   ],
+   "timestamp": 1792623693330
+  }
+ ],
+ "servedToolNames": {
+  "read": "mcp__custom-tools__read",
+  "bash": "mcp__custom-tools__bash",
+  "edit": "mcp__custom-tools__edit",
+  "write": "mcp__custom-tools__write",
+  "lc_lookup": "mcp__custom-tools__lc_lookup",
+  "lc_wait": "mcp__custom-tools__lc_wait",
+  "lc_stop": "mcp__custom-tools__lc_stop"
+ }
+}

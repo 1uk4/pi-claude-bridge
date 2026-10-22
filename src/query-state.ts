@@ -53,6 +53,9 @@ export class QueryContext {
 	 *  supply an id.
 	 */
 	piSessionId: string | null = null;
+	/** The SDK query's id in the cache trace (src/cache-trace.ts); undefined when
+	 *  tracing is off. Routes a continuation's records to the query it feeds. */
+	traceQueryId: string | undefined;
 	/** pi rewrote the history this query was built from (session_compact,
 	 *  session_tree in its own pi session). Set by markRebuildForSession, consumed
 	 *  by the tool-result delivery that discards the query. Not session-wide state:

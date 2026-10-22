@@ -28,7 +28,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { once } from "node:events";
 import { createServer } from "node:http";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -532,13 +533,20 @@ test("--thinking-display summarized is still an accepted flag value", { timeout:
 // --- Captured request contracts ---
 
 /** One-turn stub API: records every /v1/messages body, answers a canned "OK" SSE.
- *  Lets a contract assert on the exact request CC builds, at zero API cost. */
-function stubApi(requests) {
+ *  Lets a contract assert on the exact request CC builds, at zero API cost.
+ *  `paths` records every request line; `overloadFirst` answers that many
+ *  /v1/messages posts with a 529 first, which CC retries. */
+function stubApi(requests, { paths, overloadFirst = 0 } = {}) {
 	const server = createServer((req, res) => {
 		const chunks = [];
+		paths?.push(`${req.method} ${req.url}`);
 		req.on("data", (c) => chunks.push(c));
 		req.on("end", () => {
-			if (req.method === "POST" && req.url.startsWith("/v1/messages")) {
+			if (req.method === "POST" && req.url.includes("/v1/messages") && overloadFirst > 0) {
+				overloadFirst--;
+				res.writeHead(529, { "content-type": "application/json" });
+				res.end(JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "Overloaded" } }));
+			} else if (req.method === "POST" && req.url.includes("/v1/messages")) {
 				const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
 				requests.push(body);
 				const event = (name, obj) => `event: ${name}\ndata: ${JSON.stringify(obj)}\n\n`;
@@ -561,6 +569,79 @@ function stubApi(requests) {
 		close: () => server.close(),
 	})));
 }
+
+// --- Per-query proxy routing ---
+
+test("a path prefix on ANTHROPIC_BASE_URL is kept on every request, retries included", { timeout: 120_000 }, async () => {
+	// The bridge's trace mode gives each query its own base URL path,
+	// http://proxy/q/<queryId>, and diag/capture-proxy.mjs strips it to tie a
+	// request to its query. That only works if CC keeps the prefix on every
+	// request it sends — first attempts, retries after a 529, and anything else.
+	const requests = [];
+	const paths = [];
+	const api = await stubApi(requests, { paths, overloadFirst: 1 });
+	try {
+		const { result } = await collect(query({
+			prompt: "Reply OK.",
+			options: providerOptions({
+				maxTurns: 1, persistSession: false,
+				env: { ...process.env, ANTHROPIC_BASE_URL: `${api.url}/q/route-probe`, ENABLE_CLAUDEAI_MCP_SERVERS: "0", DISABLE_AUTO_COMPACT: "1" },
+			}),
+		}));
+		assert.equal(result?.subtype, "success", JSON.stringify(result));
+		const posts = paths.filter((p) => p.includes("/v1/messages"));
+		assert.ok(posts.length >= 2, `CC did not retry the 529, so the retry path went unchecked: ${JSON.stringify(paths)}`);
+		const unrouted = paths.filter((p) => !p.split(" ")[1].startsWith("/q/route-probe/"));
+		assert.deepEqual(unrouted, [], `requests lost the base URL prefix: ${JSON.stringify(paths)}`);
+	} finally {
+		api.close();
+	}
+});
+
+test("routing through the capture proxy does not change what CC sends", { timeout: 180_000 }, async () => {
+	// The cache trace points ANTHROPIC_BASE_URL at diag/capture-proxy.mjs, and
+	// Claude Code gates some behavior on the API host (CC source: tool search,
+	// thinking-binding beta), so the trace also sets _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL
+	// (src/cache-trace.ts traceQueryStart). Same prompt, tools and settings
+	// with and without the proxy: CC's loaded tools and the prompt size of its first
+	// request (input + cache read + cache write) must match, or traced runs do not
+	// stand for untraced ones. Reads the size off message_start, which the SDK
+	// streams either way.
+	const out = mkdtempSync(join(tmpdir(), "cc-proxy-neutral-"));
+	const proxy = spawn(process.execPath, ["diag/capture-proxy.mjs", "--port", "0", "--out", out], { stdio: ["ignore", "ignore", "pipe"] });
+	let log = "";
+	const url = await new Promise((resolve) => proxy.stderr.on("data", (d) => { log += d; const m = log.match(/capture proxy on (http:\S+)/); if (m) resolve(m[1]); }));
+	const run = async (extraEnv) => {
+		let tools = null;
+		let usage = null;
+		const q = query({
+			prompt: "Reply OK.",
+			options: providerOptions({
+				maxTurns: 1, persistSession: false, includePartialMessages: true,
+				mcpServers: toolServer([noArgTool("alpha")], []),
+				env: { ...process.env, ENABLE_CLAUDEAI_MCP_SERVERS: "0", DISABLE_AUTO_COMPACT: "1", ...extraEnv },
+			}),
+		});
+		for await (const message of q) {
+			if (message.type === "system" && message.subtype === "init") tools = [...message.tools].sort();
+			if (message.type === "stream_event" && message.event.type === "message_start" && !usage) usage = message.event.message.usage;
+		}
+		return { tools, size: usage && usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens };
+	};
+	try {
+		const direct = await run({});
+		const proxied = await run({ _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL: "1", ANTHROPIC_BASE_URL: `${url}/q/neutral` });
+		assert.ok(direct.size > 0 && proxied.size > 0, "no usage on message_start");
+		assert.ok(readFileSync(join(out, "index.jsonl"), "utf8").includes("/v1/messages"), "the proxied run did not go through the proxy");
+		assert.deepEqual(proxied.tools, direct.tools, "CC loaded different tools behind the proxy");
+		assert.equal(proxied.size, direct.size, "CC's first request is a different size behind the proxy");
+	} finally {
+		const exited = once(proxy, "exit");
+		proxy.kill("SIGTERM");
+		await exited; // it writes its end manifest first
+		rmSync(out, { recursive: true, force: true });
+	}
+});
 
 /** cache_control markers are breakpoint directives, not cache-keyed content — CC 2.1.280
  *  moves them (and a 1h ttl) between turns, so payload comparisons strip them. */
