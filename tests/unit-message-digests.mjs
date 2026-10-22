@@ -42,6 +42,18 @@ describe("pi message digests", () => {
 		assert.notEqual(digestMessage(result(image("AAA"))), digestMessage(result(image("BBB"))));
 	});
 
+	it("matches tool-result flattening, markers, and the image block shape", () => {
+		const text = (value) => ({ type: "text", text: value });
+		const digest = (content) => digestMessage(result(content));
+		assert.equal(digest([text("a\nb")]), digest([text("a"), text("b")]));
+		assert.equal(digest([text("x"), { type: "audio" }]), digest([text("x\n[audio]")]));
+		assert.notEqual(digest([text("x"), { type: "audio" }]), digest([text("x")]));
+		assert.equal(digest([{ type: "audio" }]), digest(""));
+		const withImage = (data) => [text("x"), { type: "image", data, mimeType: "image/png" }];
+		assert.notEqual(digest(withImage("one")), digest([text("x")]));
+		assert.notEqual(digest(withImage("one")), digest(withImage("two")));
+	});
+
 	it("replays only bridge-owned signed thinking", () => {
 		const content = [{ type: "thinking", thinking: "plan", thinkingSignature: "sig" }];
 		const own = assistant(content, { provider: "claude-bridge" });

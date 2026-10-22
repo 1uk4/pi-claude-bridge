@@ -37,7 +37,7 @@ import { join } from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { createSession, deleteSession, openSession, repairToolPairing } from "cc-session-io";
+import { createSession, deleteSession, getProjectDir, openSession, repairToolPairing } from "cc-session-io";
 
 const CWD = process.cwd();
 const MODEL = "claude-haiku-4-5";
@@ -78,11 +78,13 @@ const noArgTool = (name) => ({ name, description: `Returns the ${name} value.`, 
 async function collect(q) {
 	const toolUses = [];
 	const toolResults = [];
+	const assistantUuids = [];
 	let init = null;
 	let result = null;
 	for await (const message of q) {
 		if (message.type === "system" && message.subtype === "init") init = message;
 		if (message.type === "assistant") {
+			assistantUuids.push(message.uuid);
 			for (const block of message.message?.content ?? []) {
 				if (block.type === "tool_use") toolUses.push({ id: block.id, name: block.name });
 			}
@@ -94,7 +96,7 @@ async function collect(q) {
 		}
 		if (message.type === "result") result = message;
 	}
-	return { init, result, toolUses, toolResults };
+	return { init, result, toolUses, toolResults, assistantUuids };
 }
 
 /** Run only far enough to read the init message, then kill the CLI. */
@@ -536,7 +538,7 @@ test("--thinking-display summarized is still an accepted flag value", { timeout:
  *  Lets a contract assert on the exact request CC builds, at zero API cost.
  *  `paths` records every request line; `overloadFirst` answers that many
  *  /v1/messages posts with a 529 first, which CC retries. */
-function stubApi(requests, { paths, overloadFirst = 0 } = {}) {
+function stubApi(requests, { paths, overloadFirst = 0, toolCallsFirst = [] } = {}) {
 	const server = createServer((req, res) => {
 		const chunks = [];
 		paths?.push(`${req.method} ${req.url}`);
@@ -550,14 +552,18 @@ function stubApi(requests, { paths, overloadFirst = 0 } = {}) {
 				const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
 				requests.push(body);
 				const event = (name, obj) => `event: ${name}\ndata: ${JSON.stringify(obj)}\n\n`;
+				const tools = requests.length === 1 ? toolCallsFirst : [];
+				const blocks = tools.length ? tools.map((name, i) => ({ type: "tool_use", id: `toolu_stub_${i}`, name, input: {} })) : [{ type: "text", text: "" }];
+				const contentEvents = blocks.map((block, index) =>
+					event("content_block_start", { type: "content_block_start", index, content_block: block })
+					+ event("content_block_delta", { type: "content_block_delta", index, delta: block.type === "tool_use" ? { type: "input_json_delta", partial_json: "{}" } : { type: "text_delta", text: "OK" } })
+					+ event("content_block_stop", { type: "content_block_stop", index })).join("");
 				res.writeHead(200, { "content-type": "text/event-stream" });
 				res.end(
 					event("message_start", { type: "message_start", message: { id: `msg_stub_${requests.length}`, type: "message", role: "assistant", content: [], model: body.model, stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } } })
-					+ event("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })
 					+ event("ping", { type: "ping" })
-					+ event("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "OK" } })
-					+ event("content_block_stop", { type: "content_block_stop", index: 0 })
-					+ event("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 1 } })
+					+ contentEvents
+					+ event("message_delta", { type: "message_delta", delta: { stop_reason: tools.length ? "tool_use" : "end_turn", stop_sequence: null }, usage: { output_tokens: 1 } })
 					+ event("message_stop", { type: "message_stop" }));
 			} else {
 				res.writeHead(404).end();
@@ -618,6 +624,93 @@ test("resumeSessionAt + forkSession keeps the cut UUIDs and leaves the ancestor 
 		api.close();
 		deleteSession(source.sessionId, cwd, process.env.CLAUDE_CONFIG_DIR);
 		if (forkId) deleteSession(forkId, cwd, process.env.CLAUDE_CONFIG_DIR);
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
+test("a truncating fork preserves parallel results outside the leaf's parent path", { timeout: 120_000 }, async () => {
+	const requests = [];
+	const api = await stubApi(requests, { toolCallsFirst: ["mcp__custom-tools__alpha", "mcp__custom-tools__beta"] });
+	const cwd = mkdtempSync(join(tmpdir(), "cc-parallel-fork-"));
+	const calls = [];
+	const options = providerOptions({
+		cwd, maxTurns: 3,
+		mcpServers: toolServer([noArgTool("alpha"), noArgTool("beta")], calls),
+		env: { ...process.env, ANTHROPIC_BASE_URL: api.url, ENABLE_CLAUDEAI_MCP_SERVERS: "0", DISABLE_AUTO_COMPACT: "1", CLAUDE_CODE_ELEGANT_MEADOW: "0" },
+	});
+	try {
+		const seed = await collect(query({ prompt: "Call alpha and beta in parallel.", options }));
+		assert.equal(seed.result?.subtype, "success", JSON.stringify(seed.result));
+		assert.equal(calls.length, 2);
+		const source = openSession({ sessionId: seed.init.session_id, projectPath: cwd, claudeDir: process.env.CLAUDE_CONFIG_DIR });
+		const cut = seed.assistantUuids.at(-1);
+		const byId = new Map(source.records.map((r) => [r.uuid, r]));
+		const parentPath = new Set();
+		for (let record = byId.get(cut); record; record = byId.get(record.parentUuid)) parentPath.add(record.uuid);
+		const results = source.records.filter((r) => r.type === "user" && Array.isArray(r.message.content) && r.message.content.some((b) => b.type === "tool_result"));
+		assert.equal(results.length, 2);
+		assert.ok(results.some((r) => !parentPath.has(r.uuid)), "the seed must exercise sibling result records");
+		const before = readFileSync(source.jsonlPath);
+		for (const forkCut of [results.at(-1).uuid, cut]) {
+			const marker = `PARALLEL-FORK-${forkCut}`;
+			const forked = await collect(query({ prompt: `Reply OK to ${marker}.`, options: { ...options, resume: seed.init.session_id, resumeSessionAt: forkCut, forkSession: true } }));
+			assert.equal(forked.result?.subtype, "success", JSON.stringify(forked.result));
+			const fork = openSession({ sessionId: forked.init.session_id, projectPath: cwd, claudeDir: process.env.CLAUDE_CONFIG_DIR });
+			assert.ok(results.every((r) => fork.records.some((f) => f.uuid === r.uuid)), "fork dropped a sibling result record");
+			const sent = requests.find((r) => JSON.stringify(r.messages).includes(marker));
+			assert.ok(sent, "fork sent no request");
+			for (const value of ["alpha-VALUE", "beta-VALUE"]) assert.ok(JSON.stringify(sent.messages).includes(value), `fork dropped ${value}`);
+			assert.deepEqual(readFileSync(source.jsonlPath), before);
+		}
+	} finally {
+		api.close();
+		rmSync(getProjectDir(cwd, process.env.CLAUDE_CONFIG_DIR), { recursive: true, force: true });
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
+test("a steer replayed after a completed turn has its own user record after that assistant", { timeout: 120_000 }, async () => {
+	const requests = [];
+	const api = await stubApi(requests);
+	const cwd = mkdtempSync(join(tmpdir(), "cc-late-steer-"));
+	const sessionId = randomUUID();
+	const steerUuid = randomUUID();
+	let release;
+	const completed = new Promise((resolve) => { release = resolve; });
+	async function* prompts() {
+		yield { type: "user", message: { role: "user", content: "Reply OK to FIRST-TURN." }, parent_tool_use_id: null, uuid: randomUUID() };
+		await completed;
+		yield { type: "user", message: { role: "user", content: "Reply OK to LATE-STEER." }, parent_tool_use_id: null, uuid: steerUuid, priority: "next" };
+	}
+	try {
+		const messages = [];
+		let results = 0;
+		for await (const message of query({
+			prompt: prompts(),
+			options: providerOptions({
+				cwd, sessionId,
+				extraArgs: { "strict-mcp-config": null, "replay-user-messages": null },
+				env: { ...process.env, ANTHROPIC_BASE_URL: api.url, ENABLE_CLAUDEAI_MCP_SERVERS: "0", DISABLE_AUTO_COMPACT: "1", CLAUDE_CODE_ELEGANT_MEADOW: "0" },
+			}),
+		})) {
+			messages.push(message);
+			if (message.type === "result") { assert.equal(message.subtype, "success"); if (++results === 1) release(); }
+		}
+		assert.equal(results, 2, "both turns must complete");
+		const firstAssistant = messages.find((m) => m.type === "assistant");
+		const replay = messages.find((m) => m.type === "user" && m.isReplay && m.uuid === steerUuid);
+		assert.ok(firstAssistant && replay, "the late steer must be replay-acknowledged");
+		assert.ok(messages.indexOf(firstAssistant) < messages.indexOf(replay));
+		const session = openSession({ sessionId, projectPath: cwd, claudeDir: process.env.CLAUDE_CONFIG_DIR });
+		const firstAt = session.records.findIndex((r) => r.uuid === firstAssistant.uuid);
+		const steerAt = session.records.findIndex((r) => r.uuid === steerUuid);
+		assert.ok(firstAt >= 0 && steerAt > firstAt, "late steer must follow the already completed assistant");
+		assert.equal(session.records[steerAt].type, "user", "a later-turn steer is a user record, not a queued_command attachment");
+		assert.ok(requests.some((r) => JSON.stringify(r.messages).includes("LATE-STEER")));
+	} finally {
+		release();
+		api.close();
+		rmSync(getProjectDir(cwd, process.env.CLAUDE_CONFIG_DIR), { recursive: true, force: true });
 		rmSync(cwd, { recursive: true, force: true });
 	}
 });
