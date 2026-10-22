@@ -102,8 +102,13 @@ export type DroppedContent = {
 export function convertPiMessages(
 	messages: PiMessage[],
 	customToolNameToSdk?: Map<string, string>,
-): { anthropicMessages: SessionMessage[]; sanitizedIds: Map<string, string>; dropped: DroppedContent } {
-	const anthropicMessages = [];
+): { anthropicMessages: SessionMessage[]; sanitizedIds: Map<string, string>; dropped: DroppedContent; origins: number[][] } {
+	const anthropicMessages: SessionMessage[] = [];
+	const sources = new Map<SessionMessage, number[]>();
+	const append = (message: SessionMessage, index: number) => {
+		anthropicMessages.push(message);
+		sources.set(message, [index]);
+	};
 	const sanitizedIds = new Map();
 	// What conversion discarded. Nothing downstream can tell: a stripped thinking
 	// block and a message that never carried one convert to the same thing, so
@@ -115,10 +120,10 @@ export function convertPiMessages(
 	let turnResults: { role: "user"; content: Array<Record<string, unknown>> } | null = null;
 	let turnAssistantIdx: number | null = null;
 
-	for (const msg of messages) {
+	for (const [piIndex, msg] of messages.entries()) {
 		if (msg.role === "user") {
 			if (typeof msg.content === "string") {
-				anthropicMessages.push({ role: "user", content: msg.content || "[empty]" });
+				append({ role: "user", content: msg.content || "[empty]" }, piIndex);
 			} else if (Array.isArray(msg.content)) {
 				const parts = [];
 				for (const block of msg.content) {
@@ -127,9 +132,9 @@ export function convertPiMessages(
 						parts.push({ type: "image", source: { type: "base64", media_type: block.mimeType, data: block.data } });
 					}
 				}
-				anthropicMessages.push({ role: "user", content: parts.length ? parts : "[image]" });
+				append({ role: "user", content: parts.length ? parts : "[image]" } as SessionMessage, piIndex);
 			} else {
-				anthropicMessages.push({ role: "user", content: "[empty]" });
+				append({ role: "user", content: "[empty]" }, piIndex);
 			}
 		} else if (msg.role === "assistant") {
 			const content = Array.isArray(msg.content) ? msg.content : [];
@@ -177,7 +182,7 @@ export function convertPiMessages(
 			if (!blocks.length) blocks.push({ type: "text", text: "[incompatible content omitted]" });
 			turnResults = null;
 			turnAssistantIdx = anthropicMessages.length;
-			anthropicMessages.push({ role: "assistant", content: blocks });
+			append({ role: "assistant", content: blocks } as SessionMessage, piIndex);
 		} else if (msg.role === "toolResult") {
 			// Pi records one message per tool result, and repairToolPairing only
 			// pairs results that share the user message directly after their
@@ -209,14 +214,16 @@ export function convertPiMessages(
 			const block = { type: "tool_result", tool_use_id: sanitizeToolId(msg.toolCallId, sanitizedIds), content: toolResultContent(msg.content), is_error: msg.isError };
 			if (turnResults) {
 				turnResults.content.push(block);
+				sources.get(turnResults as unknown as SessionMessage)!.push(piIndex);
 			} else {
 				turnResults = { role: "user", content: [block] };
 				// A result with no assistant message before it is malformed history;
 				// appending keeps it in order for repairToolPairing to discard.
-				anthropicMessages.splice(turnAssistantIdx === null ? anthropicMessages.length : turnAssistantIdx + 1, 0, turnResults);
+				sources.set(turnResults as unknown as SessionMessage, [piIndex]);
+				anthropicMessages.splice(turnAssistantIdx === null ? anthropicMessages.length : turnAssistantIdx + 1, 0, turnResults as unknown as SessionMessage);
 			}
 		}
 	}
 
-	return { anthropicMessages, sanitizedIds, dropped };
+	return { anthropicMessages, sanitizedIds, dropped, origins: anthropicMessages.map((message) => sources.get(message)!) };
 }

@@ -8,6 +8,7 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { emptyState } from "./lib/session-state.mjs";
 import { createSession } from "cc-session-io";
 import { snapshotControl } from "../diag/lib/trace-analysis.mjs";
 import { tmpdir } from "node:os";
@@ -106,7 +107,7 @@ function plantSession(sid, { symlink = false } = {}) {
 	mkdirSync(join(companion, "tool-results"), { recursive: true });
 	writeFileSync(join(companion, "tool-results", "out.txt"), "persisted output");
 	if (symlink) symlinkSync("/etc/hosts", join(companion, "tool-results", "link.txt"));
-	setSharedSession(sid, { sessionId: session.sessionId, cursor: 1, cwd: process.cwd(), needsRebuild: true });
+	setSharedSession(sid, emptyState(session.sessionId, process.cwd(), { needsRebuild: true }));
 	return session;
 }
 const history = () => [user("q1"), { role: "assistant", content: [{ type: "text", text: "a1" }], provider: "claude-bridge", api: "x", model: "m", stopReason: "stop", timestamp: clock++ }, user("q2")];
@@ -132,7 +133,7 @@ describe("cache trace", () => {
 		assert.notEqual(first.callId, second.callId);
 		assert.equal(first.piSessionId, "pi-on");
 		const decision = all.find((e) => e.type === "decision");
-		assert.deepEqual([decision.callId, decision.path, decision.reason], [first.callId, "clean-start", "no-priors"]);
+		assert.deepEqual([decision.callId, decision.path, decision.reason], [first.callId, "clean-start", "no-state"]);
 		const start = all.find((e) => e.type === "query-start");
 		assert.equal(start.callId, first.callId);
 		assert.equal(spawned[0].env.ANTHROPIC_BASE_URL, `http://127.0.0.1:9/q/${start.queryId}`);
@@ -172,16 +173,16 @@ describe("cache trace", () => {
 		assert.equal(input.source.messages[0].blocks[0].type, "text");
 	});
 
-	it("copies the session before a rebuild deletes it, and the copy passes as a resume control", async () => {
+	it("copies the ancestor before a rebuild rotates away from it, and the copy passes as a resume control", async () => {
 		process.env.CLAUDE_BRIDGE_TRACE_DIR = traceDir;
 		process.env.CLAUDE_BRIDGE_TRACE_RAW = "1";
 		const session = plantSession("pi-snap");
 		await streamSimple(model, { messages: history(), tools }, { sessionId: "pi-snap" }).result();
 
-		assert.ok(!readFileSync(session.jsonlPath, "utf8").includes("BEFORE-REBUILD-MARKER"), "the rebuild did not replace the file");
+		assert.match(readFileSync(session.jsonlPath, "utf8"), /BEFORE-REBUILD-MARKER/, "the ancestor must remain untouched");
 		const all = events();
 		const snap = all.find((e) => e.type === "snapshot");
-		assert.deepEqual([snap.reason, snap.writer, snap.complete], ["rebuild-delete", "no-known-writer", true]);
+		assert.deepEqual([snap.reason, snap.writer, snap.complete], ["rebuild-rotate", "no-known-writer", true]);
 		assert.ok(snap.seq < all.find((e) => e.type === "rebuild-written").seq);
 		const copied = join(runDir(), "snapshots", snap.snapshotId, "files", `${session.sessionId}.jsonl`);
 		assert.match(readFileSync(copied, "utf8"), /BEFORE-REBUILD-MARKER/);

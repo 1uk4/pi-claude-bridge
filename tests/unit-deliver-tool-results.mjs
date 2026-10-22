@@ -8,6 +8,7 @@
  */
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
+import { emptyState } from "./lib/session-state.mjs";
 import { QueryContext } from "../src/query-state.js";
 
 const { __test } = await import("../src/index.js");
@@ -89,29 +90,30 @@ describe("deliverToolResults", () => {
 		assert.deepStrictEqual(sent[0].message.content, withImage);
 	});
 
-	// The caller has already advanced the session cursor past the steer, so a steer
-	// that never reached CC would be skipped forever by count-based sync.
-	it("marks the session for rebuild when the push is rejected, and still delivers results", async () => {
+	// An unacknowledged steer must never count as covered history.
+	it("leaves a coverage gap when the push is rejected, and still delivers results", async () => {
 		const rec = makeRecorder();
 		const c = new QueryContext();
 		c.promptStream = rec.promptStream("reject");
 		c.pendingToolCalls.set("call-1", rec.handler("read"));
-		__test.setSharedSession(null, { sessionId: "abc", cursor: 3, cwd: "/tmp", needsRebuild: false });
+		__test.setSharedSession(null, emptyState("abc", "/tmp", { needsRebuild: false }));
 
 		await __test.deliverToolResults(c, [result("call-1")], steerText, 4);
 
 		assert.deepStrictEqual(rec.order, ["push:actually stop", "push-rejected", "resolve:read"]);
-		assert.equal(__test.getSharedSession(null).needsRebuild, true);
+		assert.deepEqual(c.recording.recorded.digests, []);
+		assert.equal(__test.getSharedSession(null).needsRebuild, false);
 	});
 
-	it("marks the session for rebuild when there is no prompt stream", async () => {
+	it("leaves a coverage gap when there is no prompt stream", async () => {
 		const c = new QueryContext();
 		c.promptStream = null;
-		__test.setSharedSession(null, { sessionId: "abc", cursor: 3, cwd: "/tmp", needsRebuild: false });
+		__test.setSharedSession(null, emptyState("abc", "/tmp", { needsRebuild: false }));
 
 		await __test.deliverToolResults(c, [], steerText, 4);
 
-		assert.equal(__test.getSharedSession(null).needsRebuild, true);
+		assert.deepEqual(c.recording.recorded.digests, []);
+		assert.equal(__test.getSharedSession(null).needsRebuild, false);
 	});
 
 	it("queues a result whose handler has not arrived yet", async () => {

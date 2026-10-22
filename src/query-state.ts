@@ -9,11 +9,19 @@
 import type { AssistantMessage, AssistantMessageEventStream, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import type { McpResult } from "./extract-tool-results.js";
 import type { PromptStream } from "./prompt-stream.js";
+import { LiveRecording } from "./session-sync.js";
 import type { RateLimitInfo } from "./rate-limit.js";
 
 export interface PendingToolCall {
 	toolName: string;
 	resolve: (result: McpResult) => void;
+}
+
+export interface AssistantStep {
+	content: AssistantMessage["content"];
+	uuid?: string;
+	seen: Set<string>;
+	emitted?: { digest: string; index: number; template: AssistantMessage };
 }
 
 export class QueryContext {
@@ -25,7 +33,11 @@ export class QueryContext {
 	/** Latest rate_limit_event not yet reported. CC sends it after message_stop, when a
 	 *  tool call has already ended the stream, so it waits for the next call's stream. */
 	heldRateLimit: RateLimitInfo | undefined;
-	latestCursor = 0;
+	recording = new LiveRecording();
+	/** Complete SDK blocks, keyed by API message id, survive resetTurnState and
+	 * late echoes after the tool-call stream has ended. */
+	assistantSteps = new Map<string, AssistantStep>();
+	lastAssistantMessageId: string | undefined;
 	pendingToolCalls = new Map<string, PendingToolCall>();
 	pendingResults = new Map<string, McpResult>();
 	/** tool_use ids emitted this turn. Sole purpose is routing a delivered result
@@ -63,9 +75,6 @@ export class QueryContext {
 	 *  the way a module flag does.
 	 */
 	historyStale = false;
-	/** A steer never reached CC. A first query has no session mirror yet, so
-	 *  completion must carry this into the mirror it creates. */
-	missedSteer = false;
 
 	// Per-turn (reset together)
 	turnOutput: AssistantMessage | null = null;
@@ -104,6 +113,7 @@ export class QueryContext {
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 			stopReason: "stop", timestamp: Date.now(),
 		};
+		this.lastAssistantMessageId = undefined;
 		this.turnStarted = false;
 		this.turnSawStreamEvent = false;
 		this.turnSawToolCall = false;
