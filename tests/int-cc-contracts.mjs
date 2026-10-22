@@ -31,13 +31,13 @@ import { randomUUID } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
 import { createServer } from "node:http";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { createSession, openSession, repairToolPairing } from "cc-session-io";
+import { createSession, deleteSession, openSession, repairToolPairing } from "cc-session-io";
 
 const CWD = process.cwd();
 const MODEL = "claude-haiku-4-5";
@@ -569,6 +569,58 @@ function stubApi(requests, { paths, overloadFirst = 0 } = {}) {
 		close: () => server.close(),
 	})));
 }
+
+test("resumeSessionAt + forkSession keeps the cut UUIDs and leaves the ancestor untouched", { timeout: 120_000 }, async () => {
+	const requests = [];
+	const api = await stubApi(requests);
+	const cwd = mkdtempSync(join(tmpdir(), "cc-fork-contract-"));
+	const source = createSession({ projectPath: cwd, claudeDir: process.env.CLAUDE_CONFIG_DIR, model: MODEL });
+	let forkId;
+	try {
+		source.addUserMessage("Remember KEPT-FORK-MARKER.");
+		source.addAssistantMessage([{ type: "text", text: "Remembered KEPT-FORK-MARKER." }]);
+		source.save();
+		const kept = source.records.map((r) => r.uuid);
+		const cut = kept.at(-1);
+		source.addUserMessage("Remember DROPPED-FORK-MARKER instead.");
+		source.addAssistantMessage([{ type: "text", text: "Remembered DROPPED-FORK-MARKER." }]);
+		source.save();
+		const dropped = source.records.slice(kept.length).map((r) => r.uuid);
+		const before = readFileSync(source.jsonlPath);
+		const mtime = statSync(source.jsonlPath).mtimeMs;
+		const promptUuid = randomUUID();
+		async function* prompt() {
+			yield { type: "user", message: { role: "user", content: "Reply OK to FORK-CONTRACT-PROMPT." }, parent_tool_use_id: null, uuid: promptUuid };
+		}
+		const { init, result } = await collect(query({
+			prompt: prompt(),
+			options: providerOptions({
+				cwd, maxTurns: 1, resume: source.sessionId, resumeSessionAt: cut, forkSession: true,
+				env: { ...process.env, ANTHROPIC_BASE_URL: api.url, ENABLE_CLAUDEAI_MCP_SERVERS: "0", DISABLE_AUTO_COMPACT: "1", CLAUDE_CODE_ELEGANT_MEADOW: "0" },
+			}),
+		}));
+		forkId = init?.session_id;
+		assert.equal(result?.subtype, "success", JSON.stringify(result));
+		assert.ok(forkId && forkId !== source.sessionId, "fork must have a new session id");
+		const fork = openSession({ sessionId: forkId, projectPath: cwd, claudeDir: process.env.CLAUDE_CONFIG_DIR });
+		const ids = fork.records.filter((r) => r.uuid).map((r) => r.uuid);
+		assert.deepEqual(ids.slice(0, kept.length), kept, "kept record UUIDs must survive the fork");
+		assert.ok(dropped.every((id) => !ids.includes(id)), "discarded record UUIDs survived the cut");
+		const next = fork.records.find((r) => r.uuid === promptUuid);
+		assert.equal(next?.parentUuid, cut, "supplied prompt UUID must be parented on the cut");
+		const body = requests.find((r) => JSON.stringify(r.messages).includes("FORK-CONTRACT-PROMPT"));
+		assert.ok(body, "CC sent no fork request");
+		assert.match(JSON.stringify(body.messages), /KEPT-FORK-MARKER/);
+		assert.doesNotMatch(JSON.stringify(body.messages), /DROPPED-FORK-MARKER/);
+		assert.deepEqual(readFileSync(source.jsonlPath), before, "fork mutated the ancestor bytes");
+		assert.equal(statSync(source.jsonlPath).mtimeMs, mtime, "fork touched the ancestor mtime");
+	} finally {
+		api.close();
+		deleteSession(source.sessionId, cwd, process.env.CLAUDE_CONFIG_DIR);
+		if (forkId) deleteSession(forkId, cwd, process.env.CLAUDE_CONFIG_DIR);
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
 
 // --- Per-query proxy routing ---
 
