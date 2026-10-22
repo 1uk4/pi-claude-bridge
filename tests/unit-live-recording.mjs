@@ -87,7 +87,7 @@ it("out-of-order parallel results cut only at the end of the complete batch", ()
 	live.results([{ role: "assistant", content: [] }, result("X"), result("Y")]);
 	live.result("Y", "first-record");
 	live.result("X", "last-record");
-	assert.deepEqual(live.recorded.uuids, ["assistant-uuid", "last-record", "last-record"]);
+	assert.deepEqual(live.recorded.uuids, ["assistant-uuid", "last-record", "first-record"]);
 	assert.deepEqual(live.recorded.cuttable, [false, false, true]);
 });
 
@@ -98,4 +98,87 @@ it("coalesced prompt users share a boundary but only the last can be cut", () =>
 	assert.deepEqual(live.recorded.cuttable, [false, true]);
 	live.acknowledge("prompt");
 	assert.deepEqual(live.recorded.cuttable, [false, true]);
+});
+
+it("an old buffered message cannot touch a replacement context after awaited rate-limit reporting", async () => {
+	const c = new QueryContext();
+	c.resetTurnState(model);
+	c.currentPiStream = createAssistantMessageEventStream();
+	let enter, release;
+	const entered = new Promise((r) => { enter = r; });
+	const held = new Promise((r) => { release = r; });
+	c.heldRateLimit = { status: "allowed", utilization: 0.1 };
+	c.currentOnResponse = async () => { enter(); await held; };
+	const sdk = (async function* () { yield { type: "assistant", parent_tool_use_id: null, uuid: "old", message: { id: "old-api", model: model.id, content: [{ type: "text", text: "old buffered text" }] } }; })();
+	c.activeQuery = sdk;
+	const consuming = __test.consumeQuery(sdk, new Map(), model, () => false, c);
+	await entered;
+	__test.discardRewrittenQuery(c);
+	c.resetTurnState(model);
+	c.turnOutput.content.push({ type: "text", text: "replacement" });
+	c.recording = new LiveRecording();
+	const replacement = c.currentPiStream = createAssistantMessageEventStream();
+	release();
+	await consuming;
+	assert.deepEqual(c.turnOutput.content, [{ type: "text", text: "replacement" }]);
+	assert.deepEqual(c.recording.recorded.digests, []);
+	assert.equal(c.currentPiStream, replacement);
+});
+
+for (const laterTurn of [false, true]) it(`${laterTurn ? "later-turn" : "absorbed"} steer cuts account for assistant output before its replay`, async () => {
+	const c = new QueryContext();
+	const prompt = user("prompt");
+	c.recording.users([prompt], 0, "prompt", true);
+	const call = { role: "assistant", content: [{ type: "toolCall", id: "X", name: "read", arguments: {} }], provider: model.provider, timestamp: 1 };
+	c.recording.assistant(digestMessage(call), ["X"], "call");
+	const tr = result("X"), steer = user("steer");
+	const context = [prompt, call, tr, steer];
+	c.recording.results(context);
+	c.recording.users(context, 3, "steer", false);
+	c.resetTurnState(model);
+	const stream = c.currentPiStream = createAssistantMessageEventStream();
+	const complete = (id, text) => ({ type: "assistant", parent_tool_use_id: null, uuid: id, message: { id, model: model.id, content: [{ type: "text", text }] } });
+	const replay = { type: "user", parent_tool_use_id: null, isReplay: true, uuid: "steer", message: { role: "user", content: "steer" } };
+	await consume(c, [
+		{ type: "user", parent_tool_use_id: null, uuid: "result", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "X", content: "X" }] } },
+		...(laterTurn ? [complete("before-steer", "before replay")] : []),
+		replay,
+		complete("after-steer", "after replay"),
+	]);
+	__test.finalizeCurrentStream(c);
+	const output = await stream.result();
+	assert.deepEqual(c.recording.recorded.digests, digestMessages([...context, output]));
+	assert.equal(c.recording.recorded.cuttable[3], !laterTurn, "later-turn steer must back up before the earlier merged assistant");
+	assert.equal(c.recording.recorded.cuttable[4], true);
+	assert.equal(c.recording.recorded.uuids[4], "after-steer");
+	assert.equal(c.recording.hasProgress, true);
+});
+
+it("result-only fallback output leaves an explicit live gap and cannot plain-resume hidden output", () => {
+	const c = new QueryContext();
+	c.recording.users([user("prompt")], 0, "prompt", true);
+	c.resetTurnState(model);
+	c.turnOutput.content.push({ type: "text", text: "result-only fallback" });
+	c.currentPiStream = createAssistantMessageEventStream();
+	__test.finalizeCurrentStream(c);
+	assert.equal(c.recording.hasGaps, true);
+	assert.equal(c.recording.hasProgress, false);
+	assert.deepEqual(c.recording.recorded.uuids, ["prompt"]);
+});
+
+it("completed echoes after tool-result stream attachment only cover their original step", async () => {
+	const c = new QueryContext();
+	c.resetTurnState(model);
+	const first = c.currentPiStream = createAssistantMessageEventStream();
+	const stop = fixture.findIndex((m) => m.event?.type === "message_stop");
+	const step = fixture.slice(0, stop + 1);
+	await consume(c, step.filter((m) => m.type !== "assistant"));
+	const output = await first.result();
+	c.resetTurnState(model);
+	const next = c.currentPiStream = createAssistantMessageEventStream();
+	await consume(c, step.filter((m) => m.type === "assistant"));
+	assert.deepEqual(c.recording.recorded.digests, [digestMessage(output)]);
+	assert.deepEqual(c.turnBlocks, []);
+	assert.equal(c.currentPiStream, next);
+	assert.equal(c.lastAssistantMessageId, undefined);
 });

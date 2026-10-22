@@ -13,6 +13,7 @@ const user = (content) => ({ role: "user", content, timestamp: 1 });
 const assistant = (content) => ({ role: "assistant", content, provider: "claude-bridge", timestamp: 1 });
 const say = (text) => assistant([{ type: "text", text }]);
 const calls = (...ids) => assistant(ids.map((id) => ({ type: "toolCall", id, name: "read", arguments: { path: id } })));
+const prefix = (recorded, count) => Object.fromEntries(Object.entries(recorded).map(([key, values]) => [key, values.slice(0, count)]));
 const result = (id) => ({ role: "toolResult", toolCallId: id, content: [{ type: "text", text: `result-${id}` }], isError: false, timestamp: 1 });
 let root, cwd, oldClaudeDir;
 beforeEach(() => {
@@ -72,7 +73,7 @@ describe("digest session decisions", () => {
 		const { session } = seed(priors);
 		const synced = sync([...priors, user("next")], "opus");
 		assert.notEqual(synced.sessionId, session.sessionId);
-		assert.equal(__test.getSharedSession("pi").model, "opus");
+		assert.equal(__test.getSharedSession("pi").model, "sonnet", "the prior state stays until live progress");
 	});
 	it("unattributed calls import independently and never write provider state", () => {
 		const priors = [user("hi"), say("hello")];
@@ -94,24 +95,21 @@ describe("digest session decisions", () => {
 		const { session } = seed(priors);
 		const synced = sync([...priors, user("next")], "sonnet", "pi", join(cwd, "other"));
 		assert.notEqual(synced.sessionId, session.sessionId);
-		assert.equal(__test.getSharedSession("pi").cwd, join(cwd, "other"));
+		assert.notEqual(__test.getSharedSession("pi").cwd, join(cwd, "other"), "the import is query-local until progress");
 		assert.ok(existsSync(session.jsonlPath));
 	});
 	it("carries attachments to the new transcript without reporting a count mismatch", () => {
 		const priors = [user("Review @fixture.txt"), say("noted")];
-		const { session, state } = seed(priors);
-		// Place the attachment at its prompt rather than after the assistant.
 		const original = createSession({ projectPath: cwd });
-		original.importMessages([{ role: "user", content: "Review @fixture.txt" }], { attachments: [{ afterIndex: 0, attachment: { type: "file", filename: join(cwd, "fixture.txt"), content: { type: "text", file: { filePath: join(cwd, "fixture.txt"), content: "token" } } } }] });
-		original.addAssistantMessage([{ type: "text", text: "noted" }]);
+		const recorded = importHistory(original, priors, undefined, [{ userOrdinal: 0, parentText: "Review @fixture.txt", attachment: { type: "file", filename: join(cwd, "fixture.txt"), content: { type: "text", file: { filePath: join(cwd, "fixture.txt"), content: "token" } } } }]);
 		original.save();
-		__test.setSharedSession("pi", { ...state, ccSessionId: original.sessionId, needsRebuild: true });
+		__test.setSharedSession("pi", { ...recorded, ccSessionId: original.sessionId, cwd, model: "sonnet", dirtyTail: true });
 		const notices = [];
 		__test.setPiUI({ notify: (message) => notices.push(message) });
-		const synced = sync([...priors, user("next")]);
+		const synced = sync([...priors, say("changed tail"), user("next")]);
 		assert.equal(openSession({ sessionId: synced.sessionId, projectPath: cwd }).attachments.length, 1);
 		assert.deepEqual(notices, []);
-		assert.ok(existsSync(session.jsonlPath));
+		assert.ok(existsSync(original.jsonlPath));
 	});
 });
 
@@ -174,7 +172,7 @@ describe("actual import recording", () => {
 		assert.deepEqual(recorded.cuttable, [true, false]);
 		const live = new LiveRecording(recorded, priors);
 		live.assistant(digestMessages([say("continuation")])[0], [], "live-assistant");
-		assert.deepEqual(live.recorded.cuttable, [true, false, false], "a later live reply cannot close the imported pi call either");
+		assert.deepEqual(live.recorded.cuttable, [true, false, true], "a new nonempty assistant starts a fresh logical batch");
 		const continued = [...priors, result("X")];
 		assert.deepEqual(compareHistory(digestMessages(continued), recorded), { commonPrefix: 2, cutCount: 1, equal: false });
 		// The future prefix-write path must convert from that cut, retaining the
@@ -188,6 +186,27 @@ describe("actual import recording", () => {
 		const { recorded } = imported(priors);
 		assert.deepEqual(recorded.cuttable, [true, false, false, false]);
 		assert.equal(compareHistory(digestMessages([...priors, result("Y")]), recorded).cutCount, 1);
+	});
+	for (const stopReason of ["aborted", "error"]) it(`a ${stopReason} tool call does not poison later imported or live batches`, () => {
+		const history = [user("first"), { ...calls("X"), stopReason }, user("second"), say("second answer"), user("third"), calls("Z"), result("Z"), say("third answer")];
+		const { recorded } = imported(history);
+		assert.equal(recorded.cuttable[3], true, "the later text assistant closes the previous logical batch");
+		assert.equal(recorded.cuttable[5], false, "the new tool batch still needs its result");
+		assert.equal(recorded.cuttable[6], true);
+		assert.equal(recorded.cuttable[7], true);
+		const live = new LiveRecording(prefix(recorded, 2), history.slice(0, 2));
+		live.users(history.slice(0, 3), 2, "second-prompt", true);
+		live.assistant(digestMessages([history[3]])[0], [], "second-answer");
+		live.users(history.slice(0, 5), 4, "third-prompt", true);
+		live.assistant(digestMessages([history[5]])[0], ["Z"], "third-call");
+		live.results(history.slice(0, 7));
+		live.result("Z", "third-result");
+		live.assistant(digestMessages([history[7]])[0], [], "third-answer");
+		assert.deepEqual(live.recorded.cuttable.slice(2), [false, true, true, false, true, true]);
+		const tail = imported(history.slice(0, 2)).recorded;
+		assert.deepEqual(tail.cuttable, [true, false], "an interrupted tail still needs its real result");
+		assert.equal(compareHistory(digestMessages([...history.slice(0, 2), result("X")]), tail).cutCount, 1);
+		assert.deepEqual(tail.cuttable, imported([history[0], { ...history[1], stopReason: "toolUse" }]).recorded.cuttable, "cut safety never depends on metadata-only stopReason");
 	});
 	it("comparison selects the preceding valid cut when the prefix ends in omissions", () => {
 		const messages = [user("hi"), assistant([]), assistant([])];

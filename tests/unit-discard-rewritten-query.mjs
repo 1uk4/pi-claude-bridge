@@ -4,7 +4,7 @@
  * pi checks its compaction threshold at every turn boundary inside a run, so it
  * can rewrite the history while a Claude Code query sits parked waiting for a
  * tool result. Tool-result delivery is the one provider call that never reaches
- * syncSharedSession, so `needsRebuild` alone does not stop it: the result goes
+ * syncSharedSession, so `dirtyTail` alone does not stop it: the result goes
  * into the parked query, CC answers over the pre-compaction conversation and
  * reports its full usage, and pi crosses the same threshold at the next
  * boundary. Measured in tests/int-compact-midturn-rebuild.mjs as five
@@ -98,19 +98,19 @@ describe("markRebuildForSession", () => {
 
 	it("forces the next sync down the rebuild path for the owning session's conversation", () => {
 		// Session mirrors are per pi session: parent and subagent each have one.
-		setSharedSession("pi-a", emptyState("abc", "/tmp", { needsRebuild: false, piSessionId: "pi-a" }));
-		setSharedSession("pi-b", emptyState("def", "/tmp", { needsRebuild: false, piSessionId: "pi-b" }));
+		setSharedSession("pi-a", emptyState("abc", "/tmp", { dirtyTail: false, piSessionId: "pi-a" }));
+		setSharedSession("pi-b", emptyState("def", "/tmp", { dirtyTail: false, piSessionId: "pi-b" }));
 
 		markRebuildForSession("pi-b", "session_compact:threshold");
-		assert.equal(getSharedSession("pi-a").needsRebuild, false,
+		assert.equal(getSharedSession("pi-a").dirtyTail, false,
 			"a subagent's compaction must not rebuild the conversation it never touched");
-		assert.equal(getSharedSession("pi-b").needsRebuild, true,
+		assert.equal(getSharedSession("pi-b").dirtyTail, true,
 			"--resume would replay a history pi no longer has");
 
 		markRebuildForSession(null, "session_compact:served");
 		// An unattributed rewrite marks the "(none)" bucket — the only mirror a
 		// direct caller without a session id can be serving.
-		assert.equal(getSharedSession("pi-a").needsRebuild, false,
+		assert.equal(getSharedSession("pi-a").dirtyTail, false,
 			"the parent's mirror is untouched by an unattributed rewrite");
 		// The discard set is keyed differently from the mirror on purpose: its
 		// readers all guard on a real piSessionId, so a "(none)" entry here could
@@ -195,7 +195,7 @@ describe("discardRewrittenQuery", () => {
 		void other;
 	});
 
-	it("rotates the session id of the discarding session's own mirror, because the rebuild follows the kill immediately", () => {
+	it("does not overwrite a mirror without its query-owned recording callback", () => {
 		setSharedSession("pi-parent", emptyState("abc", "/tmp", { piSessionId: "pi-parent" }));
 		const { c } = parkedQuery("call_1", "pi-parent");
 
@@ -205,14 +205,14 @@ describe("discardRewrittenQuery", () => {
 		// rebuild is the very next thing that happens — the abort path's reasoning,
 		// with the race made tighter. Another session's mirror is never touched.
 		const s = getSharedSession("pi-parent");
-		assert.equal(s.forceRotate, true);
-		assert.equal(s.needsRebuild, true);
+		assert.equal(s.dirtyTail, false);
+		assert.equal(c.discarded, true);
 	});
 
 	it("leaves a foreign session's mirror untouched when the foreign query discards", () => {
 		// pi-b's query parks, pi-b compacts, the discard rotates only pi-b's
 		// mirror — when there is none. The parent's mirror is not pi-b's to rotate.
-		setSharedSession("pi-parent", emptyState("parent", "/tmp", { needsRebuild: false, piSessionId: "pi-parent" }));
+		setSharedSession("pi-parent", emptyState("parent", "/tmp", { dirtyTail: false, piSessionId: "pi-parent" }));
 		const { c } = parkedQuery("call_1", "pi-b");
 		markRebuildForSession("pi-b", "session_compact:threshold");
 		armStaleContexts();
@@ -220,8 +220,8 @@ describe("discardRewrittenQuery", () => {
 		discardRewrittenQuery(c);
 
 		const s = getSharedSession("pi-parent");
-		assert.equal(s.needsRebuild, false, "the child's rebuild must not force the parent's next sync");
-		assert.equal(s.forceRotate, undefined, "nor rotate it: the parent conversation is intact");
+		assert.equal(s.dirtyTail, false, "the child's rebuild must not force the parent's next sync");
+		assert.equal(s.dirtyTail, false, "the parent conversation is intact");
 		assert.equal(getSharedSession("pi-b"), null, "the child never had a mirror to rotate");
 	});
 

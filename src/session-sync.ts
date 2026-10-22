@@ -17,8 +17,7 @@ export interface SessionState extends Recording {
 	cwd: string;
 	model: string;
 	piSessionId?: string;
-	needsRebuild?: boolean;
-	forceRotate?: boolean;
+	dirtyTail: boolean;
 }
 
 export function validateRecording(recorded: Recording): void {
@@ -50,7 +49,8 @@ export function compareHistory(priors: string[], recorded: Recording): { commonP
 }
 
 function updatePendingTools(pending: Set<string>, message: PiMessage): void {
-	if (message.role === "assistant") {
+	if (message.role === "assistant" && message.content.length) {
+		pending.clear();
 		for (const block of message.content) if (block.type === "toolCall") pending.add(block.id);
 	} else if (message.role === "toolResult") pending.delete(message.toolCallId);
 }
@@ -107,30 +107,33 @@ export function importHistory(session: Session, messages: PiMessage[], names?: M
 	return recorded;
 }
 
-interface LiveSlot { digest: string; uuid?: string; toolCalls: string[]; resultId?: string }
+interface LiveSlot { digest: string; uuid?: string; toolCalls: string[]; resultId?: string; assistant?: boolean; nonCuttable?: boolean; resetTools?: boolean }
 
 /** Pending slots keep their pi positions even when acknowledgements arrive out
  * of order. Only the contiguous acknowledged prefix is exposed as recorded. */
 export class LiveRecording {
 	readonly recorded: Recording;
 	private slots = new Map<number, LiveSlot>();
-	private steers = new Map<string, number[]>();
+	private steers = new Map<string, { indexes: number[]; unsafe: boolean; steering: boolean }>();
+	private progress = 0;
+	get hasProgress(): boolean { return this.progress > 0; }
+	get hasGaps(): boolean { return this.nextIndex > this.recorded.digests.length; }
+	gap(): void { this.nextIndex++; }
+	/** A later-turn steer follows output pi merges into its next assistant.
+	 * Cutting at that steer would keep the unrepresented earlier output twice. */
+	assistantObserved(): void {
+		for (const steer of this.steers.values()) if (steer.steering) steer.unsafe = true;
+	}
 	private resultUuids = new Map<string, string>();
 	private outstanding = new Set<string>();
 	private nextIndex: number;
-	private order = new Map<string, number>();
-	private boundary: string | undefined;
 	private previousUuid: string | undefined;
-	private observe(uuid: string): void {
-		if (!this.order.has(uuid)) this.order.set(uuid, this.order.size);
-	}
 	constructor(recorded?: Recording, messages: PiMessage[] = []) {
 		this.recorded = copyRecording(recorded);
 		this.nextIndex = this.recorded.digests.length;
 		for (const message of messages.slice(0, this.nextIndex)) updatePendingTools(this.outstanding, message);
 	}
-	users(messages: PiMessage[], start: number, uuid: string, acknowledged: boolean): void {
-		if (acknowledged) this.observe(uuid);
+	users(messages: PiMessage[], start: number, uuid: string, acknowledged: boolean, steering = !acknowledged): void {
 		const indexes: number[] = [];
 		for (let i = start; i < messages.length; i++) {
 			if (messages[i].role !== "user") continue;
@@ -138,24 +141,26 @@ export class LiveRecording {
 			indexes.push(i);
 		}
 		this.nextIndex = Math.max(this.nextIndex, messages.length);
-		if (!acknowledged) this.steers.set(uuid, indexes);
+		if (!acknowledged) this.steers.set(uuid, { indexes, unsafe: false, steering });
 		this.flush();
 	}
 	acknowledge(uuid: string): void {
-		this.observe(uuid);
-		for (const i of this.steers.get(uuid) ?? []) this.slots.get(i)!.uuid = uuid;
+		const steer = this.steers.get(uuid);
+		for (const i of steer?.indexes ?? []) {
+			const slot = this.slots.get(i)!;
+			slot.uuid = uuid;
+			slot.nonCuttable = steer!.unsafe;
+		}
 		this.steers.delete(uuid);
 		this.flush();
 	}
-	assistant(digest: string, toolCalls: string[], uuid?: string): number {
-		if (uuid) this.observe(uuid);
+	assistant(digest: string, toolCalls: string[], uuid?: string, resetTools = true): number {
 		const index = this.nextIndex++;
-		this.slots.set(index, { digest, uuid, toolCalls });
+		this.slots.set(index, { digest, uuid, toolCalls, assistant: true, resetTools });
 		this.flush();
 		return index;
 	}
 	completeAssistant(index: number, uuid: string): void {
-		this.observe(uuid);
 		const slot = this.slots.get(index);
 		if (slot) slot.uuid = uuid;
 		this.flush();
@@ -170,7 +175,6 @@ export class LiveRecording {
 		this.flush();
 	}
 	result(id: string, uuid: string): void {
-		this.observe(uuid);
 		this.resultUuids.set(id, uuid);
 		for (const slot of this.slots.values()) if (slot.resultId === id) slot.uuid = uuid;
 		this.flush();
@@ -180,19 +184,19 @@ export class LiveRecording {
 			const i = this.recorded.digests.length;
 			const slot = this.slots.get(i);
 			if (!slot?.uuid) break;
+			if (slot.resetTools) this.outstanding.clear();
 			for (const id of slot.toolCalls) this.outstanding.add(id);
 			if (slot.resultId) this.outstanding.delete(slot.resultId);
-			// A batch may acknowledge results in a different order than pi. Its
-			// final boundary must cover every earlier slot, not just this result.
-			if (!this.boundary || this.order.get(slot.uuid)! > this.order.get(this.boundary)!) this.boundary = slot.uuid;
+			// Store each live slot's own anchor. Stream acknowledgement order is
+			// not physical file order; cut resolution derives the group boundary
+			// from all retained anchors, including steer source_uuid aliases.
 			if (i && this.previousUuid === slot.uuid) this.recorded.cuttable[i - 1] = false;
-			const laterContent = [...this.slots].some(([index, pending]) => index > i && pending.uuid
-				&& this.order.get(pending.uuid)! <= this.order.get(this.boundary!)!);
-			const cuttable = this.outstanding.size === 0 && !laterContent;
+			const cuttable = this.outstanding.size === 0 && !slot.nonCuttable;
 			this.recorded.digests.push(slot.digest);
-			this.recorded.uuids.push(cuttable ? this.boundary : slot.uuid);
+			this.recorded.uuids.push(slot.uuid);
 			this.recorded.cuttable.push(cuttable);
 			this.previousUuid = slot.uuid;
+			if (slot.assistant) this.progress++;
 			this.slots.delete(i);
 		}
 	}

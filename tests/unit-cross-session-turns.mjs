@@ -33,7 +33,7 @@ beforeEach(() => {
 	setQuery(({ prompt, options }) => {
 		const script = scripts.shift();
 		assert.ok(script, "script queued");
-		const sessionId = options.resume ?? script.id;
+		const sessionId = options.sessionId ?? options.resume;
 		calls.push({ resume: options.resume, sessionId });
 		const path = getSessionPath(sessionId, options.cwd, root);
 		let parentUuid = null;
@@ -51,6 +51,7 @@ beforeEach(() => {
 		const gen = (async function* () {
 			const input = prompt[Symbol.asyncIterator]();
 			const initial = (await input.next()).value;
+			void input.next().catch(() => {}); // SDK pump acknowledges stdin before waiting for more input
 			record("user", initial.message.content, initial.uuid);
 			yield { type: "system", subtype: "init", session_id: sessionId };
 			const sdkAssistant = (content, id) => {
@@ -95,8 +96,8 @@ describe("cross-session conversation isolation", () => {
 		assertCoverage("parent", [ask, tool, tr, answer]);
 		scripts.push({ id: "unused", text: "ok" });
 		await call("parent", [ask, tool, tr, answer, user("next")]).result();
-		assert.equal(calls.at(-1).resume, "cc-parent");
-		assert.equal(getSharedSession("child").ccSessionId, "cc-child");
+		assert.equal(calls.at(-1).resume, calls[0].sessionId);
+		assert.equal(getSharedSession("child").ccSessionId, calls[1].sessionId);
 	});
 	it("a background child finishing after a parent does not overwrite it", async () => {
 		const ask = user("parent");
@@ -107,11 +108,11 @@ describe("cross-session conversation isolation", () => {
 		const child = call("child", [user("child")]);
 		scripts.push({ id: "unused", text: "ok" });
 		await call("parent", [ask, answer, user("next")]).result();
-		assert.equal(calls.at(-1).resume, "cc-P");
+		assert.equal(calls.at(-1).resume, calls[0].sessionId);
 		g.open();
 		await child.result();
-		assert.equal(getSharedSession("parent").ccSessionId, "cc-P");
-		assert.equal(getSharedSession("child").ccSessionId, "cc-C");
+		assert.equal(getSharedSession("parent").ccSessionId, calls[0].sessionId);
+		assert.equal(getSharedSession("child").ccSessionId, calls[1].sessionId);
 	});
 	for (const firstTurn of [false, true]) it(`an unacknowledged steer leaves a contiguous gap (${firstTurn ? "first" : "later"} turn)`, async () => {
 		let history = [];
@@ -129,14 +130,15 @@ describe("cross-session conversation isolation", () => {
 		await __test.deliverToolResults(c, [], [{ type: "text", text: "missed steer" }], history.length + 2, [...history, ask, steer]);
 		g.open();
 		const answer = await pending.result();
-		assert.deepEqual(getSharedSession("parent").digests, digestMessages([...history, ask]));
-		const previous = getSharedSession("parent").ccSessionId;
-		const before = readFileSync(getSessionPath(previous, process.cwd(), root));
+		if (firstTurn) assert.equal(getSharedSession("parent"), null, "no contiguous assistant progress leaves no new mirror");
+		else assert.deepEqual(getSharedSession("parent").digests, digestMessages([...history, ask]));
+		const previous = getSharedSession("parent")?.ccSessionId;
+		const before = previous ? readFileSync(getSessionPath(previous, process.cwd(), root)) : null;
 		scripts.push({ id: "unused" });
 		await call("parent", [...history, ask, steer, answer, user("third")]).result();
-		assert.notEqual(calls.at(-1).resume, previous);
+		assert.notEqual(calls.at(-1).sessionId, previous);
 		assert.match(readFileSync(getSessionPath(calls.at(-1).resume, process.cwd(), root), "utf8"), /missed steer/);
-		assert.deepEqual(readFileSync(getSessionPath(previous, process.cwd(), root)), before);
+		if (previous) assert.deepEqual(readFileSync(getSessionPath(previous, process.cwd(), root)), before);
 	});
 	it("completion uses identity CAS and cannot overwrite a replacement state", async () => {
 		const g = gate();

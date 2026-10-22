@@ -94,6 +94,8 @@ A steer is non-cuttable if any assistant content after its delivery preceded its
 
 A cut must follow the last pi message sharing a CC record (coalesced prompts, parallel results), with no tool call outstanding. Cutting inside a group would keep later pi content (a redacted second message inside a shared prompt), and cutting inside a tool batch would leave a tool call without its result -- converting only the suffix then has no assistant for the result, and `repairToolPairing` drops it as orphaned (verified offline by the sol review).
 
+Tool batches follow conversion: a new non-empty assistant supersedes the previous batch; an omitted empty assistant does not. A dangling tail stays non-cuttable even if marked error/aborted, because a host can deliver its result later.
+
 For example, importing `[A(X,Y), R_X, steer, R_Y]` writes `A`, a merged `{R_X,R_Y}` record, then the steer. A cut after the pi slot for `R_Y` must therefore resolve through the steer's record, not stop at the result record. An omitted empty assistant between results is non-cuttable and does not close the outstanding batch.
 
 **Parallel results are not a single parent path.** CC can parent each result to its own split tool-call record, leaving earlier results outside the final leaf's `parentUuid` path. They are still part of the selected transcript and survive native forks at the batch's last result or final assistant (pinned in `int-cc-contracts.mjs`). Informational slot uuids must resolve in the transcript; a cuttable boundary must resolve on the selected parent path. Row 7 must retain those sibling results, not just walk back from the cut's parent.
@@ -112,7 +114,7 @@ P = digests of pi's current priors; k = length of the common prefix of P and `st
 | 3 | `state.model` differs from this query's model | write pi's history to a new session | none to keep |
 | 4 | k = len(P) = len(digests), not dirty | plain resume | all kept |
 | 5 | c = 0 (compaction, or a difference before the first cut) | write pi's history to a new session, as today | none to keep |
-| 6 | c = len(P) (pi's history is a prefix of what CC has, or equal but dirty) | `resumeSessionAt` at slot c's resolved cut, `forkSession: true`; new id read from `init` (as `capturedSessionId` is today) | kept up to the cut (measured) |
+| 6 | c = len(P) (pi's history is a prefix of what CC has, or equal but dirty) | `resumeSessionAt` at slot c's resolved cut, `forkSession: true`, with a pre-minted `sessionId` confirmed by `init`; the target path is known even on failure before `init` | kept up to the cut (measured) |
 | 7 | otherwise | write a new session: CC's chain records through slot c's resolved cut verbatim (new `sessionId` field), then pi's P[c..] converted as today | kept up to c; possibly less when c is far back (below) |
 
 - **Row 6** covers `/tree` back (one or several turns), the forced no-op rebuild, a pruned history (#30, truncates instead of starting clean), and an abort or API error where pi kept the prompt but no assistant message. The cut lands on that prompt's record; the next prompt, with its supplied uuid, is written as its own record parented on it, and the API request merges the two into one user message, which is what pi's history says (measured, `fork-at-aborted-prompt`; the model answered both). If pi also retains an empty aborted assistant, that live message has no covered slot: row 7 keeps the same prompt prefix and omits the empty assistant during import. Abort acceptance tests must follow the actual pi history rather than require row 6 in both cases.

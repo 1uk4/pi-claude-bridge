@@ -21,7 +21,7 @@ export interface AssistantStep {
 	content: AssistantMessage["content"];
 	uuid?: string;
 	seen: Set<string>;
-	emitted?: { digest: string; index: number; template: AssistantMessage };
+	emitted?: { digest: string; index: number; template: AssistantMessage; ids: string[] };
 }
 
 export class QueryContext {
@@ -38,6 +38,12 @@ export class QueryContext {
 	 * late echoes after the tool-call stream has ended. */
 	assistantSteps = new Map<string, AssistantStep>();
 	lastAssistantMessageId: string | undefined;
+	turnAssistantIds: string[] = [];
+	/** Synchronous progress capture before killing/discarding this query. */
+	commitRecording: ((dirty: boolean) => void) | null = null;
+	stopProcess: (() => void) | null = null;
+	discarded = false;
+	sawResult = false;
 	pendingToolCalls = new Map<string, PendingToolCall>();
 	pendingResults = new Map<string, McpResult>();
 	/** tool_use ids emitted this turn. Sole purpose is routing a delivered result
@@ -79,6 +85,7 @@ export class QueryContext {
 	// Per-turn (reset together)
 	turnOutput: AssistantMessage | null = null;
 	turnStarted = false;
+	turnEmissionRecorded = false;
 	turnSawStreamEvent = false;
 	turnSawToolCall = false;
 	/** API message id from the last message_start, and whether its message_stop has
@@ -114,7 +121,9 @@ export class QueryContext {
 			stopReason: "stop", timestamp: Date.now(),
 		};
 		this.lastAssistantMessageId = undefined;
+		this.turnAssistantIds = [];
 		this.turnStarted = false;
+		this.turnEmissionRecorded = false;
 		this.turnSawStreamEvent = false;
 		this.turnSawToolCall = false;
 		this.turnStreamMessageId = undefined;

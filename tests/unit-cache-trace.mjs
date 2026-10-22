@@ -64,13 +64,13 @@ beforeEach(() => {
 		const gen = (async function* () {
 			const input = prompt[Symbol.asyncIterator]();
 			await input.next();
-			yield { type: "system", subtype: "init", session_id: `cc-${n}`, claude_code_version: "test" };
+			yield { type: "system", subtype: "init", session_id: options.sessionId ?? options.resume, claude_code_version: "test" };
 			for (const step of toolUse(`toolu_${n}`)) yield step;
 			// The SDK pulls the next input only after the tool result arrives; the
 			// prompt stream stays open, so wait on the tool handler instead.
 			await new Promise((r) => setTimeout(r, 30));
 			for (const step of text) yield step;
-			yield { type: "result", subtype: "success", session_id: `cc-${n}`, result: "done", usage: { input_tokens: 1 } };
+			yield { type: "result", subtype: "success", session_id: options.sessionId ?? options.resume, result: "done", usage: { input_tokens: 1 } };
 		})();
 		gen.interrupt = async () => {};
 		gen.close = () => {};
@@ -107,7 +107,7 @@ function plantSession(sid, { symlink = false } = {}) {
 	mkdirSync(join(companion, "tool-results"), { recursive: true });
 	writeFileSync(join(companion, "tool-results", "out.txt"), "persisted output");
 	if (symlink) symlinkSync("/etc/hosts", join(companion, "tool-results", "link.txt"));
-	setSharedSession(sid, emptyState(session.sessionId, process.cwd(), { needsRebuild: true }));
+	setSharedSession(sid, emptyState(session.sessionId, process.cwd(), { dirtyTail: true }));
 	return session;
 }
 const history = () => [user("q1"), { role: "assistant", content: [{ type: "text", text: "a1" }], provider: "claude-bridge", api: "x", model: "m", stopReason: "stop", timestamp: clock++ }, user("q2")];

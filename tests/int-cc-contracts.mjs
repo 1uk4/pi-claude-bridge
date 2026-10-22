@@ -580,7 +580,7 @@ test("resumeSessionAt + forkSession keeps the cut UUIDs and leaves the ancestor 
 	const api = await stubApi(requests);
 	const cwd = mkdtempSync(join(tmpdir(), "cc-fork-contract-"));
 	const source = createSession({ projectPath: cwd, claudeDir: process.env.CLAUDE_CONFIG_DIR, model: MODEL });
-	let forkId;
+	const forkId = randomUUID();
 	try {
 		source.addUserMessage("Remember KEPT-FORK-MARKER.");
 		source.addAssistantMessage([{ type: "text", text: "Remembered KEPT-FORK-MARKER." }]);
@@ -600,11 +600,11 @@ test("resumeSessionAt + forkSession keeps the cut UUIDs and leaves the ancestor 
 		const { init, result } = await collect(query({
 			prompt: prompt(),
 			options: providerOptions({
-				cwd, maxTurns: 1, resume: source.sessionId, resumeSessionAt: cut, forkSession: true,
+				cwd, maxTurns: 1, resume: source.sessionId, resumeSessionAt: cut, forkSession: true, sessionId: forkId,
 				env: { ...process.env, ANTHROPIC_BASE_URL: api.url, ENABLE_CLAUDEAI_MCP_SERVERS: "0", DISABLE_AUTO_COMPACT: "1", CLAUDE_CODE_ELEGANT_MEADOW: "0" },
 			}),
 		}));
-		forkId = init?.session_id;
+		assert.equal(init?.session_id, forkId, "fork must honor its pre-minted target id");
 		assert.equal(result?.subtype, "success", JSON.stringify(result));
 		assert.ok(forkId && forkId !== source.sessionId, "fork must have a new session id");
 		const fork = openSession({ sessionId: forkId, projectPath: cwd, claudeDir: process.env.CLAUDE_CONFIG_DIR });
@@ -622,7 +622,7 @@ test("resumeSessionAt + forkSession keeps the cut UUIDs and leaves the ancestor 
 	} finally {
 		api.close();
 		deleteSession(source.sessionId, cwd, process.env.CLAUDE_CONFIG_DIR);
-		if (forkId) deleteSession(forkId, cwd, process.env.CLAUDE_CONFIG_DIR);
+		deleteSession(forkId, cwd, process.env.CLAUDE_CONFIG_DIR);
 		rmSync(cwd, { recursive: true, force: true });
 	}
 });
