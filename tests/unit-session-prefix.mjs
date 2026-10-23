@@ -127,6 +127,23 @@ it("row6 forks past an uncommitted final append without touching the source", ()
 	assert.deepEqual(readFileSync(session.jsonlPath), before);
 });
 
+it("a later anchor torn from the file is outside an earlier cut, but a retained one must exist", () => {
+	const history = [user("u1"), say("a1"), user("u2"), say("a2")];
+	const { session, state } = seed(history);
+	const lines = readFileSync(session.jsonlPath, "utf8").split("\n");
+	assert.match(lines.at(-2), new RegExp(state.uuids[3]));
+	writeFileSync(session.jsonlPath, lines.slice(0, -2).join("\n") + "\n" + lines.at(-2).slice(0, 40));
+	const records = readTranscript(state);
+	assert.equal(resolveRecordingCut(records, state, 2).uuid, state.uuids[1]);
+	assert.throws(() => resolveRecordingCut(records, state, 4), /absent/);
+	const synced = sync([history[0], history[1], user("REDACTED"), history[3]]);
+	assert.equal(synced.forkAt, undefined);
+	assert.deepEqual(synced.recorded.uuids.slice(0, 2), state.uuids.slice(0, 2));
+	const written = readFileSync(openSession({ sessionId: synced.targetSessionId, projectPath: root }).jsonlPath, "utf8");
+	assert.match(written, /REDACTED/);
+	assert.doesNotMatch(written, /"u2"/);
+});
+
 it("a malformed committed line fails, whether interior or final", () => {
 	for (const torn of ['{"unfinished":\n{"type":"summary"}\n', '{"unfinished":\n']) {
 		const history = [user("a"), say("b")];

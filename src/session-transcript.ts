@@ -24,9 +24,14 @@ export function readTranscript(state: Pick<SessionState, "ccSessionId" | "cwd">)
 	return records.filter((r) => !AUDIT.has(r.type)) as RecordEntry[];
 }
 
+/** -1 when absent: a record by its own uuid or a steer's queued_command source_uuid. */
+function findBoundary(records: readonly RecordEntry[], uuid: string): number {
+	return records.findIndex((r) => r.uuid === uuid || (r.type === "attachment" && r.attachment?.type === "queued_command" && r.attachment.source_uuid === uuid));
+}
+
 function boundaryIndex(records: readonly RecordEntry[], uuid: string | null): number {
 	if (!uuid) throw new Error("Cannot resolve a null or empty session boundary");
-	const index = records.findIndex((r) => r.uuid === uuid || (r.type === "attachment" && r.attachment?.type === "queued_command" && r.attachment.source_uuid === uuid));
+	const index = findBoundary(records, uuid);
 	if (index < 0) throw new Error(`Session boundary ${uuid} is absent from the transcript`);
 	return index;
 }
@@ -63,8 +68,10 @@ export function resolveRecordingCut(records: readonly RecordEntry[], recorded: R
 	const retained = recorded.uuids.slice(0, count).filter((uuid): uuid is string => uuid !== null);
 	const index = Math.max(...retained.map((uuid) => boundaryIndex(records, uuid)));
 	const cut = resolveCut(records, records[index].uuid!);
+	// A later anchor absent from the file (a torn final append) cannot be inside the cut.
 	for (const uuid of recorded.uuids.slice(count)) {
-		if (uuid !== null && boundaryIndex(records, uuid) <= cut.index) throw new Error(`Session cut includes later pi content at ${uuid}`);
+		const index = uuid === null ? -1 : findBoundary(records, uuid);
+		if (index >= 0 && index <= cut.index) throw new Error(`Session cut includes later pi content at ${uuid}`);
 	}
 	return cut;
 }

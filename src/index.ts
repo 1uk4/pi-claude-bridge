@@ -204,12 +204,28 @@ function sessionKey(piSessionId: string | null | undefined): string {
  *  REUSE or rebuild another session's CC file, and the completion capture was
  *  last-writer-wins (a foreground child in the parent's first turn permanently
  *  reassigned the parent's conversation). Keyed lookup removes the fight: each
- *  session's reads, writes and teardown marks touch only its own mirror. */
-const sharedSessions = new Map<string, SessionState>();
-/** Keys whose persisted state has been read once; memory is authoritative after. */
-const loadedSessionStates = new Set<string>();
-/** Real pi session ids this process has read or written state for. */
-const knownSessionIds = new Set<string>();
+ *  session's reads, writes and teardown marks touch only its own mirror.
+ *
+ *  One registry per process, shared by every module instance (Symbol.for, like
+ *  MARK_REBUILD_HOOKS_KEY): a /reload or worktree instance must see the newest
+ *  in-memory state, compare-and-set against the same objects, and wait on the
+ *  same stopping children, or an old instance's post-exit save could overwrite
+ *  a newer pointer. */
+const SESSION_REGISTRY_KEY = Symbol.for("claude-bridge:sessionRegistry");
+interface SessionRegistry {
+	states: Map<string, SessionState>;
+	/** Keys whose persisted state has been read once; memory is authoritative after. */
+	loaded: Set<string>;
+	/** Real pi session ids this process has read or written state for. */
+	known: Set<string>;
+	writers: Map<string, Promise<void>>;
+}
+const sessionRegistry: SessionRegistry = ((globalThis as Record<symbol, unknown>)[SESSION_REGISTRY_KEY] as SessionRegistry | undefined)
+	?? { states: new Map(), loaded: new Set(), known: new Set(), writers: new Map() };
+(globalThis as Record<symbol, unknown>)[SESSION_REGISTRY_KEY] = sessionRegistry;
+const sharedSessions = sessionRegistry.states;
+const loadedSessionStates = sessionRegistry.loaded;
+const knownSessionIds = sessionRegistry.known;
 
 /** The mirror for `piSessionId`, or null when this session has none yet. A real
  *  pi session id reads its persisted pointer on first use (restart, /reload). */
@@ -602,8 +618,9 @@ interface SyncResult {
 // Children that are stopping or finishing, registered before their state is
 // committed. Readers of their file wait for actual child exit, never just SDK
 // iterator settlement. A healthy parked query is absent: it only appends past
-// every committed cut, so a reader never waits on it.
-const sessionWriters = new Map<string, Promise<void>>();
+// every committed cut, so a reader never waits on it. Process-wide (see
+// SESSION_REGISTRY_KEY).
+const sessionWriters = sessionRegistry.writers;
 async function waitForSessionWriter(sessionId: string | undefined, signal?: AbortSignal): Promise<void> {
 	const exited = sessionId ? sessionWriters.get(sessionId) : undefined;
 	if (!exited) return;
@@ -1759,7 +1776,7 @@ const CONTINUE_AFTER_RESUME_PROMPT =
  *  history — so the turn continues instead of ending here. Nothing is lost by
  *  killing the subprocess: pi owns the only copy of the conversation that counts. */
 function discardRewrittenQuery(c: QueryContext): void {
-	// A failed state write reaches the caller, but never leaves the query parked.
+	// A failed commit reaches the caller, but never leaves the query parked.
 	try { c.commitRecording?.(true); }
 	finally { dropParkedQuery(c); }
 }
@@ -2131,18 +2148,30 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		}
 		createdBeforeLaunch = undefined;
 		let expectedState = syncResult.state;
+		/** The latest snapshot this query committed and has not saved yet. */
+		let unsaved: SessionState | null = null;
 		// Every commit ends this query's writing (abort, discard, failure, completion),
-		// so later readers of its file wait for the child to exit.
+		// so later readers of its file wait for the child to exit. Memory is
+		// authoritative at once; the file is saved after exit (persistRecording).
 		const commitRecording = (dirty: boolean) => {
 			stopWriting();
 			if (!syncResult.writable || sessionStateFor(piSessionId) !== expectedState || (syncResult.created && !recording.hasProgress)) return;
 			const state: SessionState = { ...copyRecording(recording.recorded), ccSessionId: syncResult.targetSessionId, cwd, model: cliModel,
 				piSessionId: piSessionId ?? undefined, dirtyTail: dirty || queryCtx.historyStale || recording.hasGaps };
 			setSessionStateFor(piSessionId, state);
-			expectedState = state;
+			expectedState = unsaved = state;
 			traceEvent("session-recorded", { queryId: traceQueryId, piSessionId, ...state });
-			// Memory first: a failed write still leaves this process's sync correct.
-			saveSessionState(piSessionId!, state);
+		};
+		// A replayed uuid can precede its record on disk, so a pointer saved before
+		// exit could outlive a crash naming records that never land. Save once per
+		// snapshot, after the child exits, and only while it is still the current one.
+		const persistRecording = async () => {
+			sdkQuery.close();
+			childProcess.close();
+			await childProcess.exited;
+			const state = unsaved;
+			unsaved = null;
+			if (state && sharedSessions.get(sessionKey(piSessionId)) === state) saveSessionState(piSessionId!, state);
 		};
 		queryCtx.commitRecording = commitRecording;
 		queryCtx.activeQuery = sdkQuery;
@@ -2163,7 +2192,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		const onAbort = () => {
 			if (wasAborted) return;
 			wasAborted = true;
-			// The final snapshot for an aborted query; a failed save still tears it
+			// The final snapshot for an aborted query; a failed commit still tears it
 			// down, then surfaces.
 			try { commitRecording(true); }
 			finally {
@@ -2213,8 +2242,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			}
 		};
 		// A query failure (SDK rejection, error result, abort). onAbort already
-		// committed an aborted query's final snapshot. A failed save surfaces after
-		// the stream ends; it is never retried or mistaken for a query failure.
+		// committed an aborted query's final snapshot. Its save follows child exit
+		// in the finally below; a failure there is fatal, never retried.
 		const failQuery = (error: unknown) => {
 			if (abandonedQueries.has(sdkQuery)) return;
 			try { if (!wasAborted) commitRecording(true); }
@@ -2223,17 +2252,25 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 		// Background consumer — its recording and CAS token belong to this query.
 		void consumeQuery(sdkQuery, customToolNameToPi, model, () => wasAborted, queryCtx, traceQueryId)
-			.then(({ capturedSessionId, failure }) => {
+			.then(async ({ capturedSessionId, failure }) => {
 				if (abandonedQueries.has(sdkQuery)) return;
-				if (capturedSessionId && capturedSessionId !== syncResult.targetSessionId) throw new Error(`Claude Code initialized unexpected session ${capturedSessionId}; expected ${syncResult.targetSessionId}`);
+				if (capturedSessionId && capturedSessionId !== syncResult.targetSessionId) {
+					// A protocol violation is fatal and commits nothing, but the turn still ends.
+					const error = new Error(`Claude Code initialized unexpected session ${capturedSessionId}; expected ${syncResult.targetSessionId}`);
+					failStream(error);
+					throw error;
+				}
 				if (failure) return failQuery(failure);
 				if (wasAborted || options?.signal?.aborted) return failQuery(new Error("Operation aborted"));
 				if (queryCtx.currentPiStream) recordAssistantEmission(queryCtx);
-				try { commitRecording(!queryCtx.sawResult); }
+				commitRecording(!queryCtx.sawResult);
+				// Completion waits for the save, so a failed one ends the turn with it.
+				try { await persistRecording(); }
 				catch (error) {
 					failStream(error);
 					throw error;
 				}
+				if (wasAborted) return failQuery(new Error("Operation aborted"));
 				queryCtx.activeQuery = null;
 				activeQueryContexts.delete(queryCtx);
 				finalizeCurrentStream(queryCtx, queryCtx.turnOutput?.stopReason);
@@ -2251,11 +2288,11 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				queryCtx.activeQuery = null;
 				activeQueryContexts.delete(queryCtx);
 				stopWriting();
-				sdkQuery.close();
-				childProcess.close();
-				await childProcess.exited;
-				if (syncResult.created && !recording.hasProgress) deleteSession(syncResult.targetSessionId, cwd, process.env.CLAUDE_CONFIG_DIR);
-				if (sessionWriters.get(syncResult.targetSessionId) === childProcess.exited) sessionWriters.delete(syncResult.targetSessionId);
+				try { await persistRecording(); }
+				finally {
+					if (syncResult.created && !recording.hasProgress) deleteSession(syncResult.targetSessionId, cwd, process.env.CLAUDE_CONFIG_DIR);
+					if (sessionWriters.get(syncResult.targetSessionId) === childProcess.exited) sessionWriters.delete(syncResult.targetSessionId);
+				}
 			});
 
 	})().catch((error) => {

@@ -35,67 +35,70 @@ beforeEach(() => {
 	__test.activeQueryContexts.clear();
 	scripts = [];
 	calls = [];
-	__test.setQuery(({ options, prompt }) => {
-		const script = scripts.shift();
-		assert.ok(script, "queued external SDK script");
-		const id = options.sessionId ?? options.resume;
-		const path = getSessionPath(id, options.cwd, root);
-		let parent = null;
-		if (options.forkSession) {
-			const source = readFileSync(getSessionPath(options.resume, options.cwd, root), "utf8").trim().split("\n").map(JSON.parse);
-			const cut = source.findIndex((r) => r.uuid === options.resumeSessionAt);
-			assert.ok(cut >= 0);
-			const kept = source.slice(0, cut + 1).map((r) => ({ ...r, sessionId: id }));
-			mkdirSync(dirname(path), { recursive: true });
-			writeFileSync(path, kept.map((r) => JSON.stringify(r) + "\n").join(""));
-		}
-		if (existsSync(path)) parent = readFileSync(path, "utf8").trim().split("\n").map(JSON.parse).filter((r) => r.uuid).at(-1)?.uuid;
-		const record = (role, content, uuid) => {
-			const builder = createSession({ projectPath: options.cwd, sessionId: id });
-			if (role === "assistant") builder.addAssistantMessage(content);
-			else builder.addUserMessage(content);
-			const value = { ...builder.records[0], ...(uuid ? { uuid } : {}), parentUuid: parent };
-			parent = value.uuid;
-			mkdirSync(dirname(path), { recursive: true });
-			appendFileSync(path, JSON.stringify(value) + "\n");
-			return value;
-		};
-		const childCode = `const fs=require('fs'),crypto=require('crypto'); process.on('SIGTERM',()=>{if(${Boolean(script.hang)})return;setTimeout(()=>{if(${Boolean(script.late)}){const p=${JSON.stringify(path)};const r=fs.readFileSync(p,'utf8').trim().split('\\n').map(JSON.parse).filter(r=>r.uuid).at(-1);fs.appendFileSync(p,JSON.stringify({type:'attachment',uuid:crypto.randomUUID(),parentUuid:r.uuid,sessionId:${JSON.stringify(id)},attachment:{type:'interrupted',text:'late-exit-marker'}})+'\\n');}process.exit(0)},${script.late ? 60 : 0})});process.stdout.write('READY\\n');setInterval(()=>{},1000);`;
-		const child = options.spawnClaudeCodeProcess({ command: process.execPath, args: ["-e", childCode], cwd: root, env: process.env, signal: new AbortController().signal });
-		const ready = once(child.stdout, "data");
-		const exited = once(child, "close");
-		let release, stopped = false;
-		const parked = new Promise((r) => { release = r; });
-		const entry = { options, path, exited, child };
-		calls.push(entry);
-		const gen = (async function* () {
-			await ready;
-			const input = typeof prompt === "string" ? null : prompt[Symbol.asyncIterator]();
-			const initial = input ? (await input.next()).value : { message: { content: prompt } };
-			if (input) void input.next().catch(() => {});
-			entry.pulled = true;
-			// CC pulled the prompt from stdin, then dies booting: no record, no replay.
-			if (script.boot) { await parked; return; }
-			record("user", initial.message.content, initial.uuid);
-			if (!script.preInit) yield { type: "system", subtype: "init", session_id: id };
-			if (!script.preInit && input) yield { type: "user", isReplay: true, parent_tool_use_id: null, uuid: initial.uuid, session_id: id, message: initial.message };
-			if (script.tool) {
-				const value = record("assistant", [{ type: "tool_use", id: "X", name: "mcp__custom-tools__read", input: {} }]);
-				yield { type: "assistant", parent_tool_use_id: null, uuid: value.uuid, message: { id: "tool-api", model: model.id, content: value.message.content } };
-				await parked;
-				if (stopped) return;
-			}
-			if (!script.error) {
-				const value = record("assistant", [{ type: "text", text: "answer" }]);
-				yield { type: "assistant", parent_tool_use_id: null, uuid: value.uuid, message: { id: `answer-${id}`, model: model.id, content: value.message.content } };
-			}
-			yield { type: "result", subtype: "success", is_error: Boolean(script.error), result: script.error ?? "answer", session_id: id };
-		})();
-		gen.interrupt = async () => {};
-		gen.close = () => { stopped = true; release(); if (!child.killed) child.kill("SIGTERM"); };
-		return gen;
-	});
+	__test.setQuery(fakeQuery);
 });
+function fakeQuery({ options, prompt }) {
+	const script = scripts.shift();
+	assert.ok(script, "queued external SDK script");
+	const id = options.sessionId ?? options.resume;
+	const path = getSessionPath(id, options.cwd, root);
+	let parent = null;
+	if (options.forkSession) {
+		const source = readFileSync(getSessionPath(options.resume, options.cwd, root), "utf8").trim().split("\n").map(JSON.parse);
+		const cut = source.findIndex((r) => r.uuid === options.resumeSessionAt);
+		assert.ok(cut >= 0);
+		const kept = source.slice(0, cut + 1).map((r) => ({ ...r, sessionId: id }));
+		mkdirSync(dirname(path), { recursive: true });
+		writeFileSync(path, kept.map((r) => JSON.stringify(r) + "\n").join(""));
+	}
+	if (existsSync(path)) parent = readFileSync(path, "utf8").trim().split("\n").map(JSON.parse).filter((r) => r.uuid).at(-1)?.uuid;
+	// A deferred record reaches the file only when the child handles SIGTERM.
+	const pending = `${path}.pending`;
+	const record = (role, content, uuid, deferred = false) => {
+		const builder = createSession({ projectPath: options.cwd, sessionId: id });
+		if (role === "assistant") builder.addAssistantMessage(content);
+		else builder.addUserMessage(content);
+		const value = { ...builder.records[0], ...(uuid ? { uuid } : {}), parentUuid: parent };
+		parent = value.uuid;
+		mkdirSync(dirname(path), { recursive: true });
+		appendFileSync(deferred ? pending : path, JSON.stringify(value) + "\n");
+		return value;
+	};
+	const childCode = `const fs=require('fs'),crypto=require('crypto'); process.on('SIGTERM',()=>{if(${Boolean(script.hang)})return;setTimeout(()=>{const q=${JSON.stringify(pending)};if(fs.existsSync(q)){fs.appendFileSync(${JSON.stringify(path)},fs.readFileSync(q));fs.unlinkSync(q);}if(${Boolean(script.late)}){const p=${JSON.stringify(path)};const r=fs.readFileSync(p,'utf8').trim().split('\\n').map(JSON.parse).filter(r=>r.uuid).at(-1);fs.appendFileSync(p,JSON.stringify({type:'attachment',uuid:crypto.randomUUID(),parentUuid:r.uuid,sessionId:${JSON.stringify(id)},attachment:{type:'interrupted',text:'late-exit-marker'}})+'\\n');}process.exit(0)},${script.late ? 60 : 0})});process.stdout.write('READY\\n');setInterval(()=>{},1000);`;
+	const child = options.spawnClaudeCodeProcess({ command: process.execPath, args: ["-e", childCode], cwd: root, env: process.env, signal: new AbortController().signal });
+	const ready = once(child.stdout, "data");
+	const exited = once(child, "close");
+	let release, stopped = false;
+	const parked = new Promise((r) => { release = r; });
+	const entry = { options, path, exited, child };
+	calls.push(entry);
+	const gen = (async function* () {
+		await ready;
+		const input = typeof prompt === "string" ? null : prompt[Symbol.asyncIterator]();
+		const initial = input ? (await input.next()).value : { message: { content: prompt } };
+		if (input) void input.next().catch(() => {});
+		entry.pulled = true;
+		// CC pulled the prompt from stdin, then dies booting: no record, no replay.
+		if (script.boot) { await parked; return; }
+		record("user", initial.message.content, initial.uuid);
+		if (!script.preInit) yield { type: "system", subtype: "init", session_id: id };
+		if (!script.preInit && input) yield { type: "user", isReplay: true, parent_tool_use_id: null, uuid: initial.uuid, session_id: id, message: initial.message };
+		if (script.tool) {
+			const value = record("assistant", [{ type: "tool_use", id: "X", name: "mcp__custom-tools__read", input: {} }], undefined, script.deferTool);
+			yield { type: "assistant", parent_tool_use_id: null, uuid: value.uuid, message: { id: "tool-api", model: model.id, content: value.message.content } };
+			await parked;
+			if (stopped) return;
+		}
+		if (!script.error) {
+			const value = record("assistant", [{ type: "text", text: "answer" }]);
+			yield { type: "assistant", parent_tool_use_id: null, uuid: value.uuid, message: { id: `answer-${id}`, model: model.id, content: value.message.content } };
+		}
+		yield { type: "result", subtype: "success", is_error: Boolean(script.error), result: script.error ?? "answer", session_id: id };
+	})();
+	gen.interrupt = async () => {};
+	gen.close = () => { stopped = true; release(); if (!child.killed) child.kill("SIGTERM"); };
+	return gen;
+}
 afterEach(async () => {
 	__test.setQuery(null);
 	for (const call of calls) if (call.child.exitCode === null && call.child.signalCode === null) call.child.kill("SIGKILL");
@@ -151,7 +154,7 @@ it("abort commits contiguous tool progress synchronously and waits for exit befo
 	assert.ok(captured, "onAbort synchronously publishes complete progress");
 	assert.equal(captured.dirtyTail, true);
 	assert.deepEqual(captured.digests, digestMessages([ask, tool]));
-	assert.deepEqual(persisted(), stored(captured), "abort progress is persisted synchronously");
+	assert.equal(persisted(), null, "the pointer is saved only after the child exits");
 	scripts.push({});
 	const next = call([ask, tool, toolResult, user("continue")]);
 	await tick();
@@ -163,6 +166,51 @@ it("abort commits contiguous tool progress synchronously and waits for exit befo
 	assert.doesNotMatch(readFileSync(calls[1].path, "utf8"), /late-exit-marker/);
 	assert.equal(calls[1].options.sessionId, undefined, "a prefix write resumes its own written id");
 	assert.equal(__test.getSharedSession("pi").ccSessionId, calls[1].options.resume);
+});
+
+it("abort publishes memory at once but saves the pointer only after exit lands its deferred record", async () => {
+	const ask = user("tool"), controller = new AbortController();
+	scripts.push({ tool: true, late: true, deferTool: true });
+	const tool = await call([ask], controller.signal).result();
+	controller.abort();
+	const captured = __test.getSharedSession("pi");
+	assert.deepEqual(captured.digests, digestMessages([ask, tool]));
+	const toolUuid = new RegExp(captured.uuids[1]);
+	await tick();
+	assert.doesNotMatch(readFileSync(calls[0].path, "utf8"), toolUuid, "the replayed record is not on disk yet");
+	assert.equal(persisted(), null, "no pointer names an unflushed uuid");
+	await calls[0].exited;
+	await tick();
+	assert.match(readFileSync(calls[0].path, "utf8"), toolUuid);
+	assert.deepEqual(persisted(), stored(captured));
+});
+
+it("a reloaded module shares state and stopping writers, and the old finalizer never overwrites its replacement", { timeout: 5000 }, async () => {
+	const ask = user("tool"), controller = new AbortController();
+	scripts.push({ tool: true, hang: true });
+	const tool = await call([ask], controller.signal).result();
+	controller.abort();
+	const committed = __test.getSharedSession("pi");
+	for (const fn of handlers.session_shutdown) fn({}, { sessionManager: { getSessionId: () => "pi" } });
+	const fresh = await import(`../src/index.js?reload=${Date.now()}`);
+	let freshProvider;
+	fresh.default({ on() {}, registerProvider: (_id, value) => { freshProvider = value; }, registerTool() {} });
+	fresh.__test.setQuery(fakeQuery);
+	assert.strictEqual(fresh.__test.getSharedSession("pi"), committed, "the newer memory state, not the empty disk");
+	const waiting = new AbortController();
+	const next = freshProvider.streamSimple(model, { messages: [ask, tool, toolResult, user("next")], tools }, { sessionId: "pi", signal: waiting.signal });
+	await tick();
+	assert.equal(calls.length, 1, "the fresh instance waits on the old instance's stopping child");
+	waiting.abort();
+	assert.equal((await next.result()).stopReason, "aborted");
+	const replacement = { digests: [], uuids: [], cuttable: [], ccSessionId: "cc-replacement", cwd: root, model: "replacement-model", piSessionId: "pi", dirtyTail: false };
+	fresh.__test.setSharedSession("pi", replacement);
+	saveSessionState("pi", replacement);
+	calls[0].child.kill("SIGKILL");
+	await calls[0].exited;
+	await tick();
+	assert.strictEqual(__test.getSharedSession("pi"), replacement);
+	assert.deepEqual(persisted(), stored(replacement));
 });
 
 it("a fresh same-session query discards a parked query and retains its progress under CAS", async () => {
@@ -437,4 +485,46 @@ it("a failed state save ends the turn with that error and is fatal, never retrie
 	assert.notEqual(code, 0, "the failed save is not swallowed");
 	assert.ok(!lines.includes("survived"));
 	assert.match(stderr, /EISDIR/);
+});
+
+it("an unexpected session id ends the turn, commits nothing, and is fatal", async () => {
+	const script = `
+		import { createHash } from "node:crypto";
+		import { existsSync } from "node:fs";
+		import { join } from "node:path";
+		const mod = await import(${JSON.stringify(new URL("../src/index.ts", import.meta.url).href)});
+		let provider;
+		mod.default({ on() {}, registerProvider: (_id, value) => { provider = value; }, registerTool() {} });
+		const model = provider.models[0];
+		const file = join(process.env.PI_CODING_AGENT_DIR, "claude-bridge", "sessions", "s-" + createHash("sha256").update("pi", "utf16le").digest("hex") + ".json");
+		mod.__test.setQuery(({ prompt }) => {
+			const gen = (async function* () {
+				const initial = (await prompt[Symbol.asyncIterator]().next()).value;
+				yield { type: "system", subtype: "init", session_id: "wrong-session" };
+				yield { type: "user", isReplay: true, parent_tool_use_id: null, uuid: initial.uuid, message: initial.message };
+				yield { type: "assistant", parent_tool_use_id: null, uuid: "answer-uuid", message: { id: "answer", model: model.id, content: [{ type: "text", text: "answer" }] } };
+				yield { type: "result", subtype: "success", is_error: false, result: "answer", session_id: "wrong-session" };
+			})();
+			gen.interrupt = async () => {};
+			gen.close = () => {};
+			return gen;
+		});
+		const output = await provider.streamSimple(model, { messages: [{ role: "user", content: "hi", timestamp: 1 }], tools: [] }, { sessionId: "pi" }).result();
+		console.log(JSON.stringify({ stopReason: output.stopReason, errorMessage: output.errorMessage, state: mod.__test.getSharedSession("pi"), saved: existsSync(file) }));
+		setTimeout(() => console.log("survived"), 200);
+	`;
+	const child = spawn(process.execPath, ["--import", "tsx", "--import", "./tests/lib/setup.mjs", "--input-type=module", "-e", script], { stdio: ["ignore", "pipe", "pipe"] });
+	let stdout = "", stderr = "";
+	child.stdout.on("data", (d) => { stdout += d; });
+	child.stderr.on("data", (d) => { stderr += d; });
+	const [code] = await once(child, "close");
+	const lines = stdout.trim().split("\n");
+	const result = JSON.parse(lines[0]);
+	assert.equal(result.stopReason, "error", stdout + stderr);
+	assert.match(result.errorMessage, /unexpected session wrong-session/);
+	assert.equal(result.state, null, "no state under the wrong target");
+	assert.equal(result.saved, false);
+	assert.notEqual(code, 0, "the protocol violation is not swallowed");
+	assert.ok(!lines.includes("survived"));
+	assert.match(stderr, /unexpected session wrong-session/);
 });
