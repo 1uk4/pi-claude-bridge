@@ -90,7 +90,7 @@ export function importHistory(session: Session, messages: PiMessage[], names?: M
 			}
 			if (rest.length) emit(session.addUserMessage(rest), sources);
 		}
-		for (const attachment of placed.attachments.filter((a) => a.afterIndex === i)) emit(session.addAttachment(attachment.attachment), sources);
+		for (const attachment of placed.filter((a) => a.afterIndex === i)) emit(session.addAttachment(attachment.attachment), sources);
 		previousSources = sources;
 	}
 	const recorded: Recording = { digests: digestMessages(messages), uuids: [], cuttable: [] };

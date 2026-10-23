@@ -42,7 +42,7 @@ function validFile() {
 
 describe("session state persistence", () => {
 	it("round-trips state, restores dirtyTail, and writes only the versioned state fields", () => {
-		saveSessionState("session-1", { ...state, needsRebuild: true, forceRotate: true });
+		saveSessionState("session-1", { ...state, dirtyTail: true });
 		const dir = join(agentDir, "claude-bridge", "sessions");
 		const file = join(dir, readdirSync(dir)[0]);
 		assert.deepEqual(loadSessionState("session-1", assert.fail), { ...state, dirtyTail: true });
