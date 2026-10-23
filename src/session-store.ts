@@ -2,16 +2,9 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { InvalidRecordingError, validateRecording, type Recording } from "./session-sync.js";
+import { InvalidRecordingError, validateRecording, type SessionState } from "./session-sync.js";
 
 const FORMAT_VERSION = 1;
-
-export interface StoredSessionState extends Recording {
-	ccSessionId: string;
-	cwd: string;
-	model: string;
-	dirtyTail: boolean;
-}
 
 function sessionsDir(): string {
 	return join(getAgentDir(), "claude-bridge", "sessions");
@@ -31,7 +24,7 @@ function reject(onReject: (message: string) => void, reason: string): null {
 	return null;
 }
 
-export function loadSessionState(piSessionId: string, onReject: (message: string) => void): StoredSessionState | null {
+export function loadSessionState(piSessionId: string, onReject: (message: string) => void): SessionState | null {
 	let text: string;
 	try {
 		text = readFileSync(statePath(piSessionId), "utf8");
@@ -78,11 +71,10 @@ export function loadSessionState(piSessionId: string, onReject: (message: string
 	};
 }
 
-export function saveSessionState(piSessionId: string, state: StoredSessionState): void {
+export function saveSessionState(piSessionId: string, state: SessionState): void {
 	for (const key of ["ccSessionId", "cwd", "model"] as const) {
 		if (typeof state[key] !== "string" || state[key] === "") throw new Error(`${key} must be a non-empty string`);
 	}
-	if (typeof state.dirtyTail !== "boolean") throw new Error("dirtyTail must be a boolean");
 	validateRecording(state);
 	const dir = sessionsDir();
 	mkdirSync(dir, { recursive: true, mode: 0o700 });

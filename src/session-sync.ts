@@ -16,7 +16,6 @@ export interface SessionState extends Recording {
 	ccSessionId: string;
 	cwd: string;
 	model: string;
-	piSessionId?: string;
 	dirtyTail: boolean;
 }
 

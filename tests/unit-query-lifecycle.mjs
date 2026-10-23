@@ -26,7 +26,7 @@ const call = (messages, signal, sessionId = "pi", callModel = model) => provider
 const say = (text) => ({ role: "assistant", content: [{ type: "text", text }], provider: model.provider, timestamp: 1 });
 const sessionsDir = () => join(process.env.PI_CODING_AGENT_DIR, "claude-bridge", "sessions");
 const persisted = (id = "pi") => loadSessionState(id, assert.fail);
-const stored = ({ piSessionId, ...state }) => ({ ...state, dirtyTail: true });
+const stored = (state) => ({ ...state, dirtyTail: true });
 const tick = () => new Promise(setImmediate);
 let scripts, calls;
 
@@ -203,7 +203,7 @@ it("a reloaded module shares state and stopping writers, and the old finalizer n
 	assert.equal(calls.length, 1, "the fresh instance waits on the old instance's stopping child");
 	waiting.abort();
 	assert.equal((await next.result()).stopReason, "aborted");
-	const replacement = { digests: [], uuids: [], cuttable: [], ccSessionId: "cc-replacement", cwd: root, model: "replacement-model", piSessionId: "pi", dirtyTail: false };
+	const replacement = { digests: [], uuids: [], cuttable: [], ccSessionId: "cc-replacement", cwd: root, model: "replacement-model", dirtyTail: false };
 	fresh.__test.setSharedSession("pi", replacement);
 	saveSessionState("pi", replacement);
 	calls[0].child.kill("SIGKILL");
@@ -353,7 +353,7 @@ it("a stale completion's CAS never overwrites the persisted replacement", async 
 	const controller = new AbortController();
 	scripts.push({ tool: true });
 	await call([user("tool")], controller.signal).result();
-	const replacement = { digests: [], uuids: [], cuttable: [], ccSessionId: "cc-replacement", cwd: root, model: "replacement-model", piSessionId: "pi", dirtyTail: false };
+	const replacement = { digests: [], uuids: [], cuttable: [], ccSessionId: "cc-replacement", cwd: root, model: "replacement-model", dirtyTail: false };
 	__test.setSharedSession("pi", replacement);
 	saveSessionState("pi", replacement);
 	controller.abort();

@@ -134,13 +134,3 @@ export class QueryContext {
 		// this query while its handlers are still pending.
 	}
 }
-
-let _ctx = new QueryContext();
-
-export function ctx(): QueryContext { return _ctx; }
-
-// Test-only: replace the module-level context so test files start clean.
-// Not called from production.
-export function resetCtx(): void {
-	_ctx = new QueryContext();
-}

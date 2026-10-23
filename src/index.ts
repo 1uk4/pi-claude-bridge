@@ -235,7 +235,7 @@ function sessionStateFor(piSessionId: string | null | undefined): SessionState |
 		knownSessionIds.add(piSessionId);
 		const stored = loadSessionState(piSessionId, (message) => diagDump("session_state_rejected", { piSessionId, message }));
 		loadedSessionStates.add(key);
-		if (stored) sharedSessions.set(key, { ...stored, piSessionId });
+		if (stored) sharedSessions.set(key, stored);
 	}
 	return sharedSessions.get(key) ?? null;
 }
@@ -801,7 +801,6 @@ export const __test = {
 		loadedSessionStates.clear();
 	},
 	markRebuildForSession,
-	getHistoryRewritten: () => historyRewrittenBySession.size > 0,
 	historyRewrittenBySession,
 	armStaleContexts,
 	discardRewrittenQuery,
@@ -2157,7 +2156,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			stopWriting();
 			if (!syncResult.writable || sessionStateFor(piSessionId) !== expectedState || (syncResult.created && !recording.hasProgress)) return;
 			const state: SessionState = { ...copyRecording(recording.recorded), ccSessionId: syncResult.targetSessionId, cwd, model: cliModel,
-				piSessionId: piSessionId ?? undefined, dirtyTail: dirty || queryCtx.historyStale || recording.hasGaps };
+				dirtyTail: dirty || queryCtx.historyStale || recording.hasGaps };
 			setSessionStateFor(piSessionId, state);
 			expectedState = unsaved = state;
 			traceEvent("session-recorded", { queryId: traceQueryId, piSessionId, ...state });

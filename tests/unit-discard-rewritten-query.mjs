@@ -98,8 +98,8 @@ describe("markRebuildForSession", () => {
 
 	it("forces the next sync down the rebuild path for the owning session's conversation", () => {
 		// Session mirrors are per pi session: parent and subagent each have one.
-		setSharedSession("pi-a", emptyState("abc", "/tmp", { dirtyTail: false, piSessionId: "pi-a" }));
-		setSharedSession("pi-b", emptyState("def", "/tmp", { dirtyTail: false, piSessionId: "pi-b" }));
+		setSharedSession("pi-a", emptyState("abc", "/tmp", { dirtyTail: false }));
+		setSharedSession("pi-b", emptyState("def", "/tmp", { dirtyTail: false }));
 
 		markRebuildForSession("pi-b", "session_compact:threshold");
 		assert.equal(getSharedSession("pi-a").dirtyTail, false,
@@ -196,7 +196,7 @@ describe("discardRewrittenQuery", () => {
 	});
 
 	it("does not overwrite a mirror without its query-owned recording callback", () => {
-		setSharedSession("pi-parent", emptyState("abc", "/tmp", { piSessionId: "pi-parent" }));
+		setSharedSession("pi-parent", emptyState("abc", "/tmp"));
 		const { c } = parkedQuery("call_1", "pi-parent");
 
 		discardRewrittenQuery(c);
@@ -212,7 +212,7 @@ describe("discardRewrittenQuery", () => {
 	it("leaves a foreign session's mirror untouched when the foreign query discards", () => {
 		// pi-b's query parks, pi-b compacts, the discard rotates only pi-b's
 		// mirror — when there is none. The parent's mirror is not pi-b's to rotate.
-		setSharedSession("pi-parent", emptyState("parent", "/tmp", { dirtyTail: false, piSessionId: "pi-parent" }));
+		setSharedSession("pi-parent", emptyState("parent", "/tmp", { dirtyTail: false }));
 		const { c } = parkedQuery("call_1", "pi-b");
 		markRebuildForSession("pi-b", "session_compact:threshold");
 		armStaleContexts();
@@ -238,8 +238,8 @@ describe("discardRewrittenQuery", () => {
 
 describe("per-session mirrors", () => {
 	it("separates the CC conversations of two pi sessions", () => {
-		setSharedSession("pi-a", emptyState("cc-a", "/tmp", { piSessionId: "pi-a" }));
-		setSharedSession("pi-b", emptyState("cc-b", "/tmp", { piSessionId: "pi-b" }));
+		setSharedSession("pi-a", emptyState("cc-a", "/tmp"));
+		setSharedSession("pi-b", emptyState("cc-b", "/tmp"));
 
 		assert.equal(getSharedSession("pi-a").ccSessionId, "cc-a");
 		assert.equal(getSharedSession("pi-b").ccSessionId, "cc-b");
@@ -251,7 +251,7 @@ describe("per-session mirrors", () => {
 	});
 
 	it("shares one bucket for unattributed callers", () => {
-		setSharedSession(null, emptyState("cc-none", "/tmp", { piSessionId: undefined }));
+		setSharedSession(null, emptyState("cc-none", "/tmp"));
 
 		assert.equal(getSharedSession(null).ccSessionId, "cc-none");
 		assert.equal(getSharedSession("pi-a"), null,

@@ -8,7 +8,6 @@
  */
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { emptyState } from "./lib/session-state.mjs";
 import { QueryContext } from "../src/query-state.js";
 
 const { __test } = await import("../src/index.js");
@@ -96,24 +95,20 @@ describe("deliverToolResults", () => {
 		const c = new QueryContext();
 		c.promptStream = rec.promptStream("reject");
 		c.pendingToolCalls.set("call-1", rec.handler("read"));
-		__test.setSharedSession(null, emptyState("abc", "/tmp", { needsRebuild: false }));
 
 		await __test.deliverToolResults(c, [result("call-1")], steerText, 4);
 
 		assert.deepStrictEqual(rec.order, ["push:actually stop", "push-rejected", "resolve:read"]);
 		assert.deepEqual(c.recording.recorded.digests, []);
-		assert.equal(__test.getSharedSession(null).needsRebuild, false);
 	});
 
 	it("leaves a coverage gap when there is no prompt stream", async () => {
 		const c = new QueryContext();
 		c.promptStream = null;
-		__test.setSharedSession(null, emptyState("abc", "/tmp", { needsRebuild: false }));
 
 		await __test.deliverToolResults(c, [], steerText, 4);
 
 		assert.deepEqual(c.recording.recorded.digests, []);
-		assert.equal(__test.getSharedSession(null).needsRebuild, false);
 	});
 
 	it("queues a result whose handler has not arrived yet", async () => {
