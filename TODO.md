@@ -151,6 +151,12 @@ Ideas and open questions, ordered by rough priority. Nothing is a commitment.
     - **`SnapshotWriter`'s `"no-known-writer"` arm is never passed.**
       `src/cache-trace.ts:321`. The snapshot taken at rotation no longer
       precedes a deletion. Belongs to the cache trace, not session sync.
+    - **The pending-tool rule lives in two places.** `updatePendingTools`
+      (`src/session-sync.ts:53`, import cuts) and `LiveRecording.flush`
+      (`src/session-sync.ts:211-218`, live cuts) both decide whether a cut is
+      safe. Their shapes differ (pi messages vs slots), so a shared helper is
+      thin -- but divergence between the two would silently disagree about
+      cut safety. Unify when next in that code.
 
 ## Open questions
 
