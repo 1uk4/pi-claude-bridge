@@ -38,3 +38,5 @@ No build step — the package ships `src` TypeScript as-is (see `files` in `pack
 ## Tests
 
 Smoke tests typically need to run outside a sandbox because they access local pi/Claude settings and auth state.
+
+Cover inputs the model chooses (tool names, message shapes), not just our own branches. A test of a copy of the code is not coverage.
