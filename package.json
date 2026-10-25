@@ -21,12 +21,15 @@
   },
   "files": [
     "src",
+    "dist",
     "README.md",
     "LICENSE",
     "assets"
   ],
   "scripts": {
-    "test:unit": "node --import tsx --import ./tests/lib/setup.mjs --test tests/unit-*.mjs",
+    "build": "tsc -p tsconfig.build.json",
+    "prepare": "npm run build",
+    "test:unit": "npm run build && node --import tsx --import ./tests/lib/setup.mjs --test tests/unit-*.mjs",
     "test": "set -a && [ -f .env.test ] && . .env.test; set +a; CLAUDE_BRIDGE_TEST_LOG_DIR=$(mktemp -d); export CLAUDE_BRIDGE_TEST_LOG_DIR; npm run test:unit && tests/int-smoke.sh && tests/int-multi-turn.sh && tests/int-cache.sh && node --import tsx --test tests/int-*.mjs && node tests/lib/check-deadlock-logs.mjs \"$CLAUDE_BRIDGE_TEST_LOG_DIR\"",
     "test:usage": "tests/usage-test.sh",
     "typecheck": "tsc --noEmit"
@@ -61,7 +64,10 @@
   },
   "exports": {
     ".": "./src/index.ts",
-    "./core": "./src/core/index.ts",
+    "./core": {
+      "types": "./dist/core/index.d.ts",
+      "default": "./dist/core/index.js"
+    },
     "./src/*": "./src/*",
     "./package.json": "./package.json"
   }
