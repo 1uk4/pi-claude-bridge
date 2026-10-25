@@ -1,7 +1,7 @@
 import { createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
 import { getModels } from "@earendil-works/pi-ai/compat";
 import { buildSessionContext, keyHint, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
+import { query, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Text } from "@earendil-works/pi-tui";
 import { createSession, deleteSession, openSession, repairToolPairing } from "cc-session-io";
@@ -25,6 +25,8 @@ import {
 } from "./prompt-capture.js";
 import { collectCarriedAttachments, placeCarriedAttachments, type CarriedAttachment } from "./attachments.js";
 import { createToolServer } from "./mcp-server.js";
+import { CC_CHILD_ENV } from "./core/env.js";
+import { REASONING_TO_EFFORT, effortForReasoning } from "./core/effort.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
 import { askClaudeCallTags, askClaudeToolDescription, buildAskClaudeParams, resolveAskClaudeDefaults, resolveAskClaudeMode, type AskClaudeMode } from "./askclaude-schema.js";
 import { nonSystemMessages, toBridgeContext } from "./transcript.js";
@@ -38,23 +40,7 @@ import { rateLimitResponse } from "./rate-limit.js";
 
 const DEBUG = process.env.CLAUDE_BRIDGE_DEBUG === "1";
 
-// Applied to every Claude Code subprocess the bridge spawns — provider, AskClaude
-// and the compact summary. One place, so a guard is added once rather than three
-// times, and so a missing one is visible.
-//
-// - ENABLE_CLAUDEAI_MCP_SERVERS=0: keep the user's claude.ai-connected MCP servers
-//   out of a pi session, which serves its own tools.
-// - DISABLE_AUTO_COMPACT=1: pi owns compaction; CC compacting its own copy would
-//   diverge from pi's history, which is the source of truth for every rebuild.
-// - CLAUDE_CODE_ELEGANT_MEADOW=0: stop CC (2.1.308+) logging every API request
-//   into its session file (`api-request`, `api-request-shape`, `api-request-blob`
-//   records). CC never reads them back to build a request; they only make the
-//   file about a third larger.
-const CC_CHILD_ENV = {
-	ENABLE_CLAUDEAI_MCP_SERVERS: "0",
-	DISABLE_AUTO_COMPACT: "1",
-	CLAUDE_CODE_ELEGANT_MEADOW: "0",
-} as const;
+// Child env guard (CC_CHILD_ENV) lives in core/env.ts: shared with the headless provider core.
 
 // Pi owns context files on the provider path, so Claude Code must not load its
 // own on top: otherwise project CLAUDE.md/AGENTS.md files arrive twice, and
@@ -1119,29 +1105,6 @@ function logServedContextWindow(label: string, message: SDKMessage, model: Model
 }
 
 // --- Effort level mapping ---
-// Pi reasoning levels → CC SDK effort levels
-
-const REASONING_TO_EFFORT: Record<string, EffortLevel> = {
-	minimal: "low", low: "low", medium: "medium", high: "high", xhigh: "max", max: "max",
-};
-
-const VALID_EFFORTS = new Set<string>(["low", "medium", "high", "xhigh", "max"]);
-
-// Prefer the model's own thinkingLevelMap (per-model overrides — e.g. a map can
-// route xhigh→xhigh where the generic table maps xhigh→max). pi-ai's catalog
-// ships a map for most Claude models; the table above covers models without
-// one, and the levels a map leaves unnamed. A null entry means the level is
-// unsupported on that model: no effort argument is sent, so Claude Code's own
-// default applies rather than the generic table's value. Map values are
-// provider-generic strings, so a map value is trusted only when it names a
-// level CC accepts.
-function effortForReasoning(model: Model<any>, reasoning: string | undefined): EffortLevel | undefined {
-	if (!reasoning) return undefined;
-	const mapped = model.thinkingLevelMap?.[reasoning];
-	if (mapped === undefined) return REASONING_TO_EFFORT[reasoning];
-	return VALID_EFFORTS.has(mapped as EffortLevel) ? mapped as EffortLevel : undefined;
-}
-
 // --- Provider helpers: misc ---
 
 function mapStopReason(reason: string | undefined): "stop" | "length" | "toolUse" {
