@@ -1,5 +1,5 @@
 /**
- * The provider core must stay loadable by a headless host (wolfd / pi-durable): no pi UI,
+ * The provider core must stay loadable by a headless host (e.g. pi-durable): no pi UI,
  * coding-agent, tui or cc-session-io imports anywhere in its transitive relative import graph.
  */
 import { describe, it } from "node:test";

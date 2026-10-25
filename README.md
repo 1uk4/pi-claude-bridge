@@ -37,7 +37,7 @@ The model list comes from pi-ai's Anthropic catalog automatically — when pi-ai
 
 The package has two layers:
 
-- **`pi-claude-bridge/core`** — a runtime-agnostic pi-ai `Provider` over the Claude Agent SDK. No pi-tui / pi-coding-agent / cc-session-io imports, no session state, so a headless host can use it. Requires `@earendil-works/pi-ai >= 1.4`. The package ships TypeScript source, so the consuming runtime must load `.ts` (tsx, a bundler, vitest).
+- **`pi-claude-bridge/core`** — a runtime-agnostic pi-ai `Provider` over the Claude Agent SDK. No pi-tui / pi-coding-agent / cc-session-io imports, no session state, so a headless host can use it. Requires `@earendil-works/pi-ai >= 1.4`. The core ships as compiled JS + types in `dist/` (built by `prepare`); the TUI entry still ships TypeScript source.
 - **The pi TUI extension** (`src/index.ts`) — session sync, prompt capture, AskClaude, UI notices. It shares the core's pure primitives (child env guard, effort mapping) and keeps its own session-resuming query path, so TUI behavior is unchanged.
 
 The core does not run the SDK's agent loop for you: your runtime owns the loop and executes tools. Tools reach Claude as MCP tools whose handlers only park until your result arrives in the next `streamSimple` transcript. The default `park` mode keeps one query alive across tool rounds (idle TTL, default 10 min); `replay` mode, and crash recovery, rebuild a fresh query from the transcript. Subscription errors are shaped for pi-ai's retry regexes (rate limit / overloaded / connection lost retry; quota / billing / auth do not). `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` are stripped from the child so turns bill the Claude Code OAuth login.

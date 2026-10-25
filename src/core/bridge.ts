@@ -5,7 +5,7 @@
 // SDK as MCP tools whose handlers NEVER execute anything: they park a promise until the
 // host returns the result in the next streamSimple call's transcript.
 //
-// Modes (proven in the wolfpack durable-bridge spike):
+// Modes (both verified against pi-durable):
 //  - park (default): ONE query() lives across tool rounds. A call whose trailing toolResults
 //    ids ⊆ a live query's `expecting` set swaps its stream onto that query and releases the
 //    parked handlers. Streaming input lets a steer reach CLI stdin BEFORE the result.

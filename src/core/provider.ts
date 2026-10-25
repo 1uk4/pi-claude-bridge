@@ -1,7 +1,7 @@
 // createClaudeBridgeProvider: the runtime-agnostic pi-ai Provider over the Claude Agent SDK.
 // Imports only pi-ai, the Agent SDK, MCP SDK and pure sibling modules — never pi-tui,
 // pi-coding-agent, cc-session-io or any pi UI/session state — so a headless host
-// (wolfd / pi-durable) can load it without dragging the TUI in.
+// (e.g. pi-durable) can load it without dragging the TUI in.
 
 import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import { createProvider } from "@earendil-works/pi-ai/models";
