@@ -51,6 +51,10 @@ type Round = {
 	blocks: Map<number, number>;
 	/** out.content length at the current message_start, so a restreamed message can be dropped. */
 	blockStart: number;
+	/** What pi already saw of an abandoned (restreamed) attempt, by block position since blockStart. Deltas can't be retracted, so the retry only emits what pi hasn't seen. */
+	replay?: { type: string; text: string }[];
+	/** out.content index → replay state for a retry block that re-covers an already-streamed one. */
+	replaying: Map<number, { seen: string; diverged: boolean }>;
 	stop?: string;
 };
 type Live = {
@@ -89,7 +93,7 @@ export class Bridge {
 	stream(model: Model<any>, context: TranscriptContext, options?: SimpleStreamOptions): EventStream {
 		const stream = createAssistantMessageEventStream();
 		const out = { role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id, usage: zeroUsage(), stopReason: "pending", timestamp: Date.now() } as unknown as AssistantMessage;
-		const round: Round = { stream, out, started: false, blocks: new Map(), blockStart: 0 };
+		const round: Round = { stream, out, started: false, blocks: new Map(), blockStart: 0, replaying: new Map() };
 
 		if (options?.signal?.aborted) { this.fail(round, "aborted", "aborted"); return stream; }
 
@@ -282,20 +286,28 @@ export class Bridge {
 		const push = (ev: any) => r.stream.push(ev);
 		if (e.type === "message_start") {
 			// Already open: Claude Code gave up on that stream and is retrying it. Drop its blocks.
-			if (r.started && out.content.length > r.blockStart) { out.content.length = r.blockStart; r.blocks.clear(); }
+			if (r.started && out.content.length > r.blockStart) {
+				r.replay = out.content.slice(r.blockStart).map((b: any) => ({ type: b.type, text: b.type === "text" ? b.text : b.type === "thinking" ? b.thinking : "" }));
+				out.content.length = r.blockStart; r.blocks.clear(); r.replaying.clear();
+			}
 			this.ensureStarted(r);
 			r.blockStart = out.content.length;
 			if (e.message?.usage) updateUsage(out, e.message.usage, model);
 		} else if (e.type === "content_block_start") {
 			const cb = e.content_block;
+			// A retry re-covering a block pi already saw: no second *_start, and deltas are trimmed to the unseen part.
+			const seenBlock = (cb.type === "text" || cb.type === "thinking") ? r.replay?.[out.content.length - r.blockStart] : undefined;
+			const replayed = seenBlock?.type === cb.type ? seenBlock : undefined;
 			if (cb.type === "text") {
 				out.content.push({ type: "text", text: "" });
 				r.blocks.set(e.index, out.content.length - 1);
-				push({ type: "text_start", contentIndex: out.content.length - 1, partial: out });
+				if (replayed) r.replaying.set(out.content.length - 1, { seen: replayed.text, diverged: false });
+				else push({ type: "text_start", contentIndex: out.content.length - 1, partial: out });
 			} else if (cb.type === "thinking") {
 				out.content.push({ type: "thinking", thinking: "", thinkingSignature: "" } as any);
 				r.blocks.set(e.index, out.content.length - 1);
-				push({ type: "thinking_start", contentIndex: out.content.length - 1, partial: out });
+				if (replayed) r.replaying.set(out.content.length - 1, { seen: replayed.text, diverged: false });
+				else push({ type: "thinking_start", contentIndex: out.content.length - 1, partial: out });
 			} else if (cb.type === "tool_use") {
 				const name = String(cb.name).startsWith(MCP_PREFIX) ? String(cb.name).slice(MCP_PREFIX.length) : String(cb.name);
 				if (!l.toolNames.has(name)) return; // unserved tool: CC rejects it and retries; surface nothing
@@ -308,8 +320,17 @@ export class Bridge {
 			const i = r.blocks.get(e.index);
 			if (i === undefined) return;
 			const b: any = out.content[i];
-			if (e.delta.type === "text_delta" && b.type === "text") { b.text += e.delta.text; push({ type: "text_delta", contentIndex: i, delta: e.delta.text, partial: out }); }
-			else if (e.delta.type === "thinking_delta" && b.type === "thinking") { b.thinking += e.delta.thinking; push({ type: "thinking_delta", contentIndex: i, delta: e.delta.thinking, partial: out }); }
+			const rp = r.replaying.get(i);
+			// What to emit for a delta: all of it, or on a replayed block only the part pi hasn't seen.
+			const unseen = (full: string, delta: string): string => {
+				if (!rp || rp.diverged) return delta;
+				if (rp.seen.startsWith(full)) return "";
+				if (full.startsWith(rp.seen)) { rp.diverged = true; return full.slice(rp.seen.length); }
+				rp.diverged = true; // the retry wrote something else; it can't be retracted, so surface the retry whole
+				return full;
+			};
+			if (e.delta.type === "text_delta" && b.type === "text") { b.text += e.delta.text; const d = unseen(b.text, e.delta.text); if (d) push({ type: "text_delta", contentIndex: i, delta: d, partial: out }); }
+			else if (e.delta.type === "thinking_delta" && b.type === "thinking") { b.thinking += e.delta.thinking; const d = unseen(b.thinking, e.delta.thinking); if (d) push({ type: "thinking_delta", contentIndex: i, delta: d, partial: out }); }
 			else if (e.delta.type === "signature_delta" && b.type === "thinking") b.thinkingSignature = (b.thinkingSignature ?? "") + e.delta.signature;
 			else if (e.delta.type === "input_json_delta" && b.type === "toolCall") {
 				b.partialJson += e.delta.partial_json;
@@ -328,6 +349,7 @@ export class Bridge {
 				push({ type: "toolcall_end", contentIndex: i, toolCall: b, partial: out });
 			}
 			r.blocks.delete(e.index);
+			r.replaying.delete(i);
 		} else if (e.type === "message_delta") {
 			if (e.usage) updateUsage(out, e.usage, model);
 			if (e.delta?.stop_reason) r.stop = e.delta.stop_reason;
