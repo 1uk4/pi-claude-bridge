@@ -33,6 +33,29 @@ The model list comes from pi-ai's Anthropic catalog automatically — when pi-ai
 
 **1M Context:** Fable 5/5.1, Opus 5.5/5/4.8/4.7, and Sonnet 5.5/5 get 1M context. Opus 4.6 gets 1M only on a Max plan or with Extra Usage, and Sonnet 4.6 only with Extra Usage — set `provider.plan` and/or `provider.longContextExtraUsage` as described in [Configuration](#configuration).
 
+## Provider core (`pi-claude-bridge/core`)
+
+The package has two layers:
+
+- **`pi-claude-bridge/core`** — a runtime-agnostic pi-ai `Provider` over the Claude Agent SDK. No pi-tui / pi-coding-agent / cc-session-io imports, no session state, so a headless host can use it. Requires `@earendil-works/pi-ai >= 1.4`. The package ships TypeScript source, so the consuming runtime must load `.ts` (tsx, a bundler, vitest).
+- **The pi TUI extension** (`src/index.ts`) — session sync, prompt capture, AskClaude, UI notices. It shares the core's pure primitives (child env guard, effort mapping) and keeps its own session-resuming query path, so TUI behavior is unchanged.
+
+The core does not run the SDK's agent loop for you: your runtime owns the loop and executes tools. Tools reach Claude as MCP tools whose handlers only park until your result arrives in the next `streamSimple` transcript. The default `park` mode keeps one query alive across tool rounds (idle TTL, default 10 min); `replay` mode, and crash recovery, rebuild a fresh query from the transcript. Subscription errors are shaped for pi-ai's retry regexes (rate limit / overloaded / connection lost retry; quota / billing / auth do not). `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` are stripped from the child so turns bill the Claude Code OAuth login.
+
+```ts
+import { createClaudeBridgeProvider } from "pi-claude-bridge/core";
+
+const provider = createClaudeBridgeProvider({
+  // mode: "park" | "replay", idleTtlMs, longContext: { plan: "max", longContextExtraUsage: false },
+  // cwd, checkAuth, onRateLimit(info), sweepOrphans (default true)
+});
+models.setProvider(provider);          // pi-ai Models; or pass via a durable engine's `models` seam
+// agent config: { provider: "claude-bridge", modelId: "claude-haiku-5-5" }
+// on host shutdown: provider.shutdown();
+```
+
+Not yet in the core: faithful session-JSONL rebuild (rebuilds render history as text), per-turn image/thinking replay.
+
 ## AskClaude Tool
 
 **Deprecated:** AskClaude is an opt-in legacy tool and may be removed in a future release. You should set `askClaude.enabled` to `true` (see [Configuration](#configuration)) to use it. You can recreate similar functionality with one of the many Pi subagent extensions.

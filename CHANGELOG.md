@@ -2,6 +2,7 @@
 
 ## UNRELEASED
 
+- **Add: runtime-agnostic provider core (`pi-claude-bridge/core`)** — `createClaudeBridgeProvider()` returns a pi-ai Provider over the Agent SDK for headless hosts: MCP tool passthrough (park mode with idle TTL, replay/crash-recovery rebuild), event mapping incl. thinking and usage, retry-aware error shaping, OAuth auth check, env hygiene, orphan `claude` sweep. The TUI extension now takes its child-env guard and effort mapping from the core; behavior is unchanged. Requires pi-ai >= 1.4 for the core.
 - **Bump: Claude Agent SDK 0.3.308 (Claude Code 2.1.308)** — Claude Code's new per-request log in session files is turned off; it made them about a third larger.
 - **Fix: queued steering keeps MCP input open through later turns (#172)** — Keep Claude Code's input open until each steer is replayed into a turn, then close after that turn completes. An error result still ends the query, so a steer Claude Code had queued can no longer run on and replace the failure. Thanks @Maverobot.
 - **Fix: abort ignored after a terminated tool batch (#200, issue #199)** — when a run ended with Claude Code's query parked at a tool call (`terminate: true`), aborting the next run did nothing. Each run that continues the query now binds its own signal. Thanks @orshih6 and @cootue.
