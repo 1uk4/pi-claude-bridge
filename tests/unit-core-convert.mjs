@@ -50,3 +50,89 @@ describe("core convert", () => {
 		assert.deepEqual(steersAfterLastAssistant(msgs), ["actually, say PINEAPPLE"]);
 	});
 });
+
+describe("core convert: images in rebuilt history", () => {
+	const img = (data) => ({ type: "image", data, mimeType: "image/png" });
+	const asst = () => ({ role: "assistant", content: [{ type: "text", text: "ok" }], timestamp: 0 });
+
+	it("keeps an image from the latest user message when the thread has history", () => {
+		const { prompt } = buildSdkInput(transcript({ messages: [user("hi"), asst(), user([{ type: "text", text: "see this" }, img("AAAA")])] }));
+		assert.ok(Array.isArray(prompt));
+		const image = prompt.filter((b) => b.type === "image");
+		assert.deepEqual(image, [{ type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } }]);
+		const text = prompt.filter((b) => b.type === "text").map((b) => b.text).join("");
+		assert.match(text, /\[user\]\nhi/);
+		assert.match(text, /\[user\]\nsee this/);
+		assert.doesNotMatch(text, /\[image\]/);
+	});
+
+	it("keeps images in order, each after the text that introduced it", () => {
+		const { prompt } = buildSdkInput(transcript({ messages: [user([img("ONE")]), asst(), user([{ type: "text", text: "second" }, img("TWO")])] }));
+		assert.deepEqual(prompt.map((b) => b.type === "image" ? b.source.data : "text"), ["text", "ONE", "text", "TWO", "text"]);
+	});
+
+	it("keeps an image returned by a tool", () => {
+		const { prompt } = buildSdkInput(transcript({
+			messages: [user("read it"), assistantToolCall("t1", "read", { path: "a.png" }), { ...toolResult("t1", "read", ""), content: [{ type: "image", data: "PIX", mimeType: "image/png" }] }],
+		}));
+		assert.ok(Array.isArray(prompt));
+		assert.deepEqual(prompt.filter((b) => b.type === "image").map((b) => b.source.data), ["PIX"]);
+		assert.match(prompt.filter((b) => b.type === "text").map((b) => b.text).join(""), /\[result of tool call t1 \(read\)\]/);
+	});
+
+	it("stays a plain string when no image is present", () => {
+		assert.equal(typeof buildSdkInput(transcript({ messages: [user("a"), asst(), user("b")] })).prompt, "string");
+	});
+
+	it("data-less image blocks degrade to a placeholder", () => {
+		const { prompt } = buildSdkInput(transcript({ messages: [user("a"), asst(), user([{ type: "image", mimeType: "image/png" }])] }));
+		assert.equal(typeof prompt, "string");
+		assert.match(prompt, /\[user\]\n\[image\]/);
+	});
+});
+
+describe("core convert: media types, multiple images, equivalence", () => {
+	const img = (data, mimeType = "image/png") => ({ type: "image", data, mimeType: mimeType === null ? undefined : mimeType });
+	const asst = () => ({ role: "assistant", content: [{ type: "text", text: "ok" }], timestamp: 0 });
+	const imageData = (prompt) => prompt.filter((b) => b.type === "image").map((b) => b.source.data);
+	const textOf = (prompt) => prompt.filter((b) => b.type === "text").map((b) => b.text).join("");
+
+	it("keeps several images in one message, in order", () => {
+		const { prompt } = buildSdkInput(transcript({ messages: [user([{ type: "text", text: "two" }, img("A"), img("B")])] }));
+		assert.deepEqual(prompt.map((b) => (b.type === "image" ? b.source.data : b.text)), ["two", "A", "B"]);
+	});
+
+	it("only jpeg/png/gif/webp become image blocks", () => {
+		for (const ok of ["image/jpeg", "image/png", "image/gif", "image/webp"]) {
+			assert.deepEqual(imageData(buildSdkInput(transcript({ messages: [user([img("X", ok)])] })).prompt), ["X"], ok);
+		}
+		for (const bad of ["image/svg+xml", "image/bmp", "application/pdf", null]) {
+			const { prompt } = buildSdkInput(transcript({ messages: [user("hi"), asst(), user([img("X", bad)])] }));
+			assert.equal(typeof prompt, "string", String(bad));
+			assert.match(prompt, /\[user\]\n\[image\]/);
+		}
+	});
+
+	it("text-only history renders exactly as the old string join did", () => {
+		const oldContentToText = (c) => (typeof c === "string" ? c : c.map((b) => (b.type === "text" ? b.text ?? "" : b.type === "image" ? "[image]" : "")).filter(Boolean).join("\n"));
+		const messages = [
+			user("add 1 2"),
+			assistantToolCall("t1", "add", { a: 1, b: 2 }),
+			toolResult("t1", "add", "3"),
+			{ role: "assistant", content: [{ type: "text", text: "three" }], timestamp: 0 },
+			user([{ type: "text", text: "line one" }, { type: "text", text: "line two" }]),
+			user([{ type: "image", mimeType: "image/png" }]),
+			user(""),
+		];
+		const turns = [];
+		for (const m of messages) {
+			if (m.role === "user") turns.push(`[user]\n${oldContentToText(m.content)}`);
+			else if (m.role === "assistant") {
+				const parts = m.content.map((b) => (b.type === "text" ? b.text : b.type === "toolCall" ? `[called tool ${b.name} id=${b.id} args=${JSON.stringify(b.arguments)}]` : "")).filter(Boolean);
+				if (parts.length) turns.push(`[assistant]\n${parts.join("\n")}`);
+			} else turns.push(`[result of tool call ${m.toolCallId} (${m.toolName})${m.isError ? " ERROR" : ""}]\n${oldContentToText(m.content)}`);
+		}
+		const expected = `${turns.join("\n\n")}\n\n[Continue the conversation from the last entry. Do not repeat tool calls whose results are shown.]`;
+		assert.equal(buildSdkInput(transcript({ messages })).prompt, expected);
+	});
+});
