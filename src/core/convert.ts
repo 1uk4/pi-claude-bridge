@@ -33,6 +33,26 @@ export interface SdkInput {
 
 type Piece = string | ContentBlockParam;
 
+/**
+ * How many images, and how many bytes of base64, a rebuilt prompt may carry. The newest images win; older ones
+ * degrade to the text "[image omitted: too large]". Images in user messages and in tool results count alike.
+ *
+ * Anthropic's vision docs (https://platform.claude.com/docs/en/build-with-claude/vision.md, and
+ * https://platform.claude.com/docs/en/api/overview.md for the request size) give: up to 100 images per request
+ * (200k-context models); more than 20 images, counting resent history and tool_result images, tightens the
+ * per-image dimension limit (so stay at 20 or fewer, or at 2000px); 8000x8000 max; 10 MB base64 per image on the
+ * Claude API but 5 MB on Bedrock; 32 MB per request; jpeg/png/gif/webp only, animations use the first frame.
+ *
+ * Defaults: 20 images (the point where the dimension limit tightens), 5 MB each (the strictest host, Bedrock),
+ * 16 MiB of base64 in all (half the request cap, leaving room for text).
+ */
+export interface ImageBudget {
+	maxImages: number;
+	maxImageBytes: number;
+	maxTotalBytes: number;
+}
+export const DEFAULT_IMAGE_BUDGET: ImageBudget = { maxImages: 20, maxImageBytes: 5 * 1024 * 1024, maxTotalBytes: 16 * 1024 * 1024 };
+
 const IMAGE_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp"] as const;
 type ImageType = (typeof IMAGE_TYPES)[number];
 const isImageType = (t: string | undefined): t is ImageType => (IMAGE_TYPES as readonly string[]).includes(t as string);
@@ -53,6 +73,26 @@ function contentPieces(content: unknown): Piece[] {
 		else if (b.type === "image") pieces.push(imagePiece(b));
 	}
 	return pieces;
+}
+
+export const OMITTED_IMAGE = "[image omitted: too large]";
+
+/** Turn the oldest images beyond the budget into OMITTED_IMAGE. Mutates `parts`. */
+
+function applyImageBudget(parts: Piece[][], budget: ImageBudget): void {
+	let count = 0;
+	let total = 0;
+	const maxImageBytes = Math.min(budget.maxImageBytes, budget.maxTotalBytes);
+	for (let i = parts.length - 1; i >= 0; i--) {
+		const piece = parts[i];
+		for (let j = piece.length - 1; j >= 0; j--) {
+			const p = piece[j];
+			if (typeof p === "string" || p.type !== "image") continue;
+			const bytes = (p.source as { data: string }).data.length;
+			if (count < budget.maxImages && bytes <= maxImageBytes && total + bytes <= budget.maxTotalBytes) { count++; total += bytes; }
+			else piece[j] = OMITTED_IMAGE;
+		}
+	}
 }
 
 /** A turn: `header` then the pieces, the header sharing the first text piece's line. */
@@ -83,18 +123,20 @@ function joinPieces(parts: Piece[][]): PromptContent {
 }
 
 /** User content as SDK input: plain string when text-only, content blocks when it carries images. */
-export function userContent(content: unknown): PromptContent {
-	const pieces = contentPieces(content);
-	if (!pieces.some((p) => typeof p !== "string")) return joinPieces([pieces]);
+export function userContent(content: unknown, budget: ImageBudget = DEFAULT_IMAGE_BUDGET): PromptContent {
+	const pieces = [contentPieces(content)];
+	applyImageBudget(pieces, budget);
+	const joined = joinPieces(pieces);
+	if (typeof joined === "string") return joined;
 	// Blocks keep the original shape: each text piece is its own block, not newline-merged.
-	return pieces.map((p): ContentBlockParam => (typeof p === "string" ? { type: "text", text: p } : p));
+	return pieces[0].map((p): ContentBlockParam => (typeof p === "string" ? { type: "text", text: p } : p));
 }
 
 /** Transcript → system prompt, current tool set, and the prompt for a fresh query. */
-export function buildSdkInput(context: TranscriptContext): SdkInput {
+export function buildSdkInput(context: TranscriptContext, budget: ImageBudget = DEFAULT_IMAGE_BUDGET): SdkInput {
 	const bridged = toBridgeContext(context as unknown as Context);
 	const messages = bridged.messages as any[];
-	// Each turn keeps its content pieces apart from its header so an image block can sit between text.
+	// Content pieces are budgeted first, then each gets its header, so a dropped image reads "[user]\n[image]".
 	const turns: { header: string; pieces: Piece[] }[] = [];
 	for (const m of messages) {
 		if (m.role === "user") turns.push({ header: "[user]\n", pieces: contentPieces(m.content) });
@@ -109,8 +151,9 @@ export function buildSdkInput(context: TranscriptContext): SdkInput {
 	}
 	const last = messages.at(-1);
 	let prompt: PromptContent;
-	if (turns.length === 1 && last?.role === "user") prompt = userContent(last.content);
+	if (turns.length === 1 && last?.role === "user") prompt = userContent(last.content, budget);
 	else {
+		applyImageBudget(turns.map((t) => t.pieces), budget);
 		prompt = joinPieces([...turns.map((t) => withHeader(t.header, t.pieces)), ["[Continue the conversation from the last entry. Do not repeat tool calls whose results are shown.]"]]);
 	}
 	return { systemPrompt: bridged.systemPrompt ?? "", tools: bridged.tools ?? [], prompt };
@@ -126,10 +169,10 @@ export function trailingToolResults(messages: readonly any[]): any[] {
 }
 
 /** User messages after the last assistant message (steer / follow-up injected mid-tool). */
-export function steersAfterLastAssistant(messages: readonly any[]): PromptContent[] {
+export function steersAfterLastAssistant(messages: readonly any[], budget: ImageBudget = DEFAULT_IMAGE_BUDGET): PromptContent[] {
 	let from = messages.length;
 	while (from > 0 && messages[from - 1].role !== "assistant") from--;
-	return messages.slice(from).filter((m) => m.role === "user").map((m) => userContent(m.content));
+	return messages.slice(from).filter((m) => m.role === "user").map((m) => userContent(m.content, budget));
 }
 
 /** Stable key over everything a parked query bakes in at spawn: system prompt + tool set. */

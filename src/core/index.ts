@@ -5,5 +5,5 @@ export { childEnv, CC_CHILD_ENV } from "./env.js";
 export { mapSdkError, USAGE_LIMIT, CONNECTION_LOST } from "./errors.js";
 export { detectClaudeLogin, type LoginProbes } from "./auth.js";
 export { sweepOrphanClaudeProcesses } from "./orphans.js";
-export { buildSdkInput } from "./convert.js";
+export { buildSdkInput, DEFAULT_IMAGE_BUDGET, type ImageBudget } from "./convert.js";
 export { effortForReasoning } from "./effort.js";

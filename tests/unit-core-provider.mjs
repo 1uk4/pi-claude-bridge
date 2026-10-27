@@ -323,3 +323,27 @@ describe("core provider surface", () => {
 		assert.match(r.source, /claude-code-oauth/);
 	});
 });
+
+describe("core imageBudget option", () => {
+	const img = (n) => ({ type: "image", data: "x".repeat(n), mimeType: "image/png" });
+	const asst = { role: "assistant", content: [{ type: "text", text: "ok" }], timestamp: 0 };
+	const messages = [user([img(3)]), asst, user([img(3)]), asst, user([img(3)])];
+	const sent = async (imageBudget) => {
+		const { run, mock, provider } = setup({ imageBudget });
+		void collect(run(transcript({ tools: [], messages })));
+		await tick();
+		const m = await new Promise((r) => { const t = setInterval(() => { if (mock.calls[0].inbox.length) { clearInterval(t); r(mock.calls[0].inbox[0]); } }, 1); });
+		provider.shutdown();
+		return m.message.content.filter((b) => b.type === "image").length;
+	};
+
+	it("an explicit undefined field keeps its default (not NaN/unlimited-by-accident)", async () => {
+		assert.equal(await sent({ maxImages: undefined, maxImageBytes: undefined, maxTotalBytes: undefined }), 3);
+	});
+	it("a given field overrides", async () => {
+		assert.equal(await sent({ maxImages: 1 }), 1);
+	});
+	it("maxImageBytes is clamped to maxTotalBytes", async () => {
+		assert.equal(await sent({ maxImageBytes: 1000, maxTotalBytes: 6 }), 2);
+	});
+});

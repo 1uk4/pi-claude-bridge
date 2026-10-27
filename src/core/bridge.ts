@@ -20,7 +20,7 @@ import { toolResultToMcpContent, type McpResult } from "../extract-tool-results.
 import { makePromptStream, userMessage, type PromptStream } from "../prompt-stream.js";
 import { updateUsage } from "../usage.js";
 import { effortForReasoning } from "./effort.js";
-import { buildSdkInput, queryKey, steersAfterLastAssistant, trailingToolResults, type PromptContent } from "./convert.js";
+import { buildSdkInput, DEFAULT_IMAGE_BUDGET, queryKey, steersAfterLastAssistant, trailingToolResults, type ImageBudget, type PromptContent } from "./convert.js";
 import { CONNECTION_LOST, mapSdkError, resultErrorText } from "./errors.js";
 
 export const MCP_SERVER = "durable";
@@ -32,6 +32,8 @@ export interface BridgeOptions {
 	mode: BridgeMode;
 	idleTtlMs: number;
 	maxTurns: number;
+	/** Image caps for rebuilt prompts and steers. Default DEFAULT_IMAGE_BUDGET. */
+	imageBudget?: ImageBudget;
 	cwd: () => string;
 	env: () => NodeJS.ProcessEnv;
 	cliModelId: (model: Model<any>) => string;
@@ -102,7 +104,7 @@ export class Bridge {
 		let tools: Tool[] = [];
 		let input: ReturnType<typeof buildSdkInput> | undefined;
 		try {
-			input = buildSdkInput(context);
+			input = buildSdkInput(context, this.opts.imageBudget ?? DEFAULT_IMAGE_BUDGET);
 			tools = input.tools;
 		} catch (e) { this.fail(round, "error", e instanceof Error ? e.message : String(e)); return stream; }
 		const key = queryKey(input.systemPrompt, tools);
@@ -183,7 +185,7 @@ export class Bridge {
 	private continueParked(l: Live, round: Round, msgs: any[], trailing: any[], rebuild: () => void): void {
 		clearTimeout(l.ttl);
 		l.cur = round;
-		const steers = steersAfterLastAssistant(msgs);
+		const steers = steersAfterLastAssistant(msgs, this.opts.imageBudget ?? DEFAULT_IMAGE_BUDGET);
 		void (async () => {
 			try {
 				// A steer must reach CLI stdin BEFORE the tool result is released (push resolves once written).

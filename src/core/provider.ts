@@ -9,6 +9,7 @@ import { getModels } from "@earendil-works/pi-ai/compat";
 import type { Model, SimpleStreamOptions, TranscriptContext } from "@earendil-works/pi-ai";
 import { applyLongContext, buildModels, claudeCodeModelId, type LongContextSettings } from "../models.js";
 import { Bridge, type BridgeMode } from "./bridge.js";
+import { DEFAULT_IMAGE_BUDGET, type ImageBudget } from "./convert.js";
 import { OAUTH_SOURCE, cachedLoginDetector } from "./auth.js";
 import { childEnv } from "./env.js";
 import { sweepOrphanClaudeProcesses } from "./orphans.js";
@@ -46,6 +47,13 @@ export interface ClaudeBridgeProviderOptions {
 	/** Receives the SDK's rate_limit_event info (plan windows) as it streams. */
 	onRateLimit?: (info: unknown) => void;
 	pathToClaudeCodeExecutable?: string;
+	/**
+	 * Caps on images carried in a rebuilt prompt (newest kept, older become "[image omitted: too large]").
+	 * Defaults: 20 images, 5 MB each, 16 MiB total; a field left undefined takes its default. The budget bounds
+	 * each rebuilt prompt and each steer, not the whole live session: a parked query accumulates images as it
+	 * runs, and MCP tool-result images (toolResultToMcpContent) are not capped.
+	 */
+	imageBudget?: Partial<ImageBudget>;
 	/** Extra SDK query options merged last. */
 	sdkOptions?: Record<string, unknown>;
 	/** Agent SDK query function. Tests inject a mock; never set in production. */
@@ -73,6 +81,11 @@ export function createClaudeBridgeProvider(opts: ClaudeBridgeProviderOptions = {
 		mode: opts.mode ?? "park",
 		idleTtlMs: opts.idleTtlMs ?? DEFAULT_IDLE_TTL_MS,
 		maxTurns: opts.maxTurns ?? DEFAULT_MAX_TURNS,
+		imageBudget: {
+			maxImages: opts.imageBudget?.maxImages ?? DEFAULT_IMAGE_BUDGET.maxImages,
+			maxTotalBytes: opts.imageBudget?.maxTotalBytes ?? DEFAULT_IMAGE_BUDGET.maxTotalBytes,
+			maxImageBytes: Math.min(opts.imageBudget?.maxImageBytes ?? DEFAULT_IMAGE_BUDGET.maxImageBytes, opts.imageBudget?.maxTotalBytes ?? DEFAULT_IMAGE_BUDGET.maxTotalBytes),
+		},
 		cwd: () => (typeof opts.cwd === "function" ? opts.cwd() : opts.cwd ?? process.cwd()),
 		env: () => childEnv(opts.env ?? process.env),
 		cliModelId: (m: Model<any>) => claudeCodeModelId(m, longContext),

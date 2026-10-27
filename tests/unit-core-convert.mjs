@@ -91,7 +91,7 @@ describe("core convert: images in rebuilt history", () => {
 	});
 });
 
-describe("core convert: media types, multiple images, equivalence", () => {
+describe("core convert: image budget, media types, equivalence", () => {
 	const img = (data, mimeType = "image/png") => ({ type: "image", data, mimeType: mimeType === null ? undefined : mimeType });
 	const asst = () => ({ role: "assistant", content: [{ type: "text", text: "ok" }], timestamp: 0 });
 	const imageData = (prompt) => prompt.filter((b) => b.type === "image").map((b) => b.source.data);
@@ -100,6 +100,35 @@ describe("core convert: media types, multiple images, equivalence", () => {
 	it("keeps several images in one message, in order", () => {
 		const { prompt } = buildSdkInput(transcript({ messages: [user([{ type: "text", text: "two" }, img("A"), img("B")])] }));
 		assert.deepEqual(prompt.map((b) => (b.type === "image" ? b.source.data : b.text)), ["two", "A", "B"]);
+	});
+
+	it("over the count budget the oldest images become [image], the newest stay", () => {
+		const messages = [user([img("1")]), asst(), user([img("2")]), asst(), user([img("3")])];
+		const { prompt } = buildSdkInput(transcript({ messages }), { maxImages: 2, maxImageBytes: 100, maxTotalBytes: 100 });
+		assert.deepEqual(imageData(prompt), ["2", "3"]);
+		assert.match(textOf(prompt), /\[user\]\n\[image omitted: too large\]/);
+	});
+
+	it("over the byte budget the oldest are dropped; an oversized single image is a placeholder", () => {
+		const messages = [user([img("a".repeat(6))]), asst(), user([img("b".repeat(6))]), asst(), user([img("c".repeat(50))])];
+		const { prompt } = buildSdkInput(transcript({ messages }), { maxImages: 9, maxImageBytes: 10, maxTotalBytes: 10 });
+		assert.deepEqual(imageData(prompt), ["b".repeat(6)]);
+	});
+
+	it("the budget also applies to a lone user message", () => {
+		const { prompt } = buildSdkInput(transcript({ messages: [user([img("1"), img("2"), img("3")])] }), { maxImages: 1, maxImageBytes: 9, maxTotalBytes: 9 });
+		assert.deepEqual(prompt.map((b) => (b.type === "image" ? b.source.data : b.text)), ["[image omitted: too large]", "[image omitted: too large]", "3"]);
+	});
+
+	it("maxImageBytes is clamped to maxTotalBytes", () => {
+		const { prompt } = buildSdkInput(transcript({ messages: [user([img("a".repeat(8))])] }), { maxImages: 5, maxImageBytes: 100, maxTotalBytes: 4 });
+		assert.equal(prompt, "[image omitted: too large]");
+	});
+
+	it("a data-less image stays the plain [image] placeholder", () => {
+		const { prompt } = buildSdkInput(transcript({ messages: [user("a"), asst(), user([{ type: "image", mimeType: "image/png" }])] }));
+		assert.match(prompt, /\[user\]\n\[image\]/);
+		assert.doesNotMatch(prompt, /omitted/);
 	});
 
 	it("only jpeg/png/gif/webp become image blocks", () => {
