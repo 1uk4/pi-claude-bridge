@@ -116,3 +116,54 @@ describe("idle TTL override", () => {
 		h.provider.shutdown();
 	});
 });
+
+describe("release edge cases", () => {
+	it("several queries on one conversation are all released", async () => {
+		const h = setup();
+		await park(h, "conv-a", "t1");
+		await park(h, "conv-a", "t2");
+		assert.equal(h.provider.liveQueries, 2);
+		assert.equal(h.provider.release("conv-a"), 2);
+		assert.equal(h.provider.liveQueries, 0);
+	});
+
+	it("a release then an immediate new call: the old in-flight round dies at its end, the new query survives", async () => {
+		const h = setup();
+		const p1 = collect(h.run(transcript({ messages: [user("one")] }), { sessionId: "conv-a" }));
+		h.mock.calls[0].push(msgStart(), toolUseBlock(0, "t1", "mcp__durable__add", "{}"));
+		await tick();
+		h.provider.release("conv-a");
+		const p2 = collect(h.run(transcript({ messages: [user("two")] }), { sessionId: "conv-a" }));
+		h.mock.calls[0].push(msgEnd("tool_use"));
+		await p1;
+		h.mock.calls[1].push(msgStart(), toolUseBlock(0, "t2", "mcp__durable__add", "{}"), msgEnd("tool_use"));
+		await p2;
+		assert.equal(h.mock.calls[0].closed, true);
+		assert.equal(h.mock.calls[1].closed, false, "the new call's query is parked");
+		assert.equal(h.provider.liveQueries, 1);
+		h.provider.shutdown();
+	});
+
+	it("a later setIdleTtl overrides an earlier per-call idleTtlMs; invalid values are ignored", async () => {
+		const h = setup({ idleTtlMs: 60_000 });
+		const { idx } = await park(h, "conv-a", "ta", { idleTtlMs: 20 });
+		h.provider.setIdleTtl("conv-a", 60_000); // before the park's timer fires, but timer is already armed at 20ms
+		h.provider.setIdleTtl("conv-b", Number.NaN);
+		h.provider.setIdleTtl("conv-b", -5);
+		const q = await park(h, "conv-b", "tb");
+		await tick(80);
+		assert.equal(h.mock.calls[idx].closed, true, "already-armed timer is unchanged");
+		assert.equal(h.mock.calls[q.idx].closed, false, "invalid override ignored: provider-wide TTL");
+		h.provider.shutdown();
+	});
+
+	it("release drops the conversation's TTL override", async () => {
+		const h = setup({ idleTtlMs: 60_000 });
+		h.provider.setIdleTtl("conv-a", 20);
+		h.provider.release("conv-a");
+		const { idx } = await park(h, "conv-a", "ta");
+		await tick(80);
+		assert.equal(h.mock.calls[idx].closed, false);
+		h.provider.shutdown();
+	});
+});

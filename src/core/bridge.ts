@@ -72,8 +72,8 @@ type Live = {
 	ttl?: ReturnType<typeof setTimeout>;
 	/** The host's conversation key (stream options `sessionId`); undefined when the host passes none. */
 	conversation?: string;
-	/** Idle TTL for this query's parks, overriding the provider-wide one (per-call option or per-conversation setting). */
-	ttlMs?: number;
+	/** The latest call's own idleTtlMs stream option; applies to that call's park only. */
+	callTtlMs?: number;
 	/** release() arrived while a call was in flight: kill when the round ends instead of parking. */
 	releaseWhenParked?: boolean;
 };
@@ -112,13 +112,18 @@ export class Bridge {
 			if (l.cur) l.releaseWhenParked = true;
 			else { this.kill(l); n++; }
 		}
+		this.ttlByConversation.delete(conversation);
 		return n;
 	}
 
 	/** Idle TTL for one conversation's parked queries (ms; 0 disables the TTL for it); undefined restores the provider-wide TTL. Applies from the next park. */
 	setIdleTtl(conversation: string, ms: number | undefined): void {
 		if (ms === undefined) this.ttlByConversation.delete(conversation);
-		else this.ttlByConversation.set(conversation, ms);
+		else if (validTtl(ms)) {
+			this.ttlByConversation.set(conversation, ms);
+			// a later setting wins over an earlier per-call value
+			for (const l of this.lives) if (l.conversation === conversation) l.callTtlMs = undefined;
+		}
 	}
 
 	stream(model: Model<any>, context: TranscriptContext, options?: SimpleStreamOptions): EventStream {
@@ -201,7 +206,8 @@ export class Bridge {
 	private tag(l: Live, options: SimpleStreamOptions | undefined): void {
 		if (options?.sessionId) l.conversation = options.sessionId;
 		const perCall = (options as { idleTtlMs?: number } | undefined)?.idleTtlMs;
-		if (typeof perCall === "number") l.ttlMs = perCall;
+		l.callTtlMs = validTtl(perCall) ? perCall : undefined;
+		l.releaseWhenParked = false; // a new call claims the query; an earlier release no longer applies
 	}
 
 	private mcpServers(tools: Tool[], l: Live) {
@@ -222,6 +228,7 @@ export class Bridge {
 	private continueParked(l: Live, round: Round, msgs: any[], trailing: any[], rebuild: () => void): void {
 		clearTimeout(l.ttl);
 		l.cur = round;
+		l.releaseWhenParked = false;
 		const steers = steersAfterLastAssistant(msgs, this.opts.imageBudget ?? DEFAULT_IMAGE_BUDGET);
 		void (async () => {
 			try {
@@ -253,7 +260,7 @@ export class Bridge {
 
 	private armTtl(l: Live): void {
 		if (l.releaseWhenParked) { this.kill(l); return; }
-		const ms = l.ttlMs ?? (l.conversation !== undefined ? this.ttlByConversation.get(l.conversation) : undefined) ?? this.opts.idleTtlMs;
+		const ms = l.callTtlMs ?? (l.conversation !== undefined ? this.ttlByConversation.get(l.conversation) : undefined) ?? this.opts.idleTtlMs;
 		if (ms <= 0) return;
 		clearTimeout(l.ttl);
 		l.ttl = setTimeout(() => this.kill(l), ms);
@@ -416,6 +423,8 @@ export class Bridge {
 		}
 	}
 }
+
+function validTtl(ms: unknown): ms is number { return typeof ms === "number" && Number.isFinite(ms) && ms > 0; }
 
 // SDKUserMessage content is typed against the Anthropic SDK block union; ours is the same shape.
 function promptBlocks(content: PromptContent): any { return content; }
