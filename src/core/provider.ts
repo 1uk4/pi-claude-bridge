@@ -63,6 +63,13 @@ export interface ClaudeBridgeProviderOptions {
 export interface ClaudeBridgeProvider extends ReturnType<typeof createProvider> {
 	/** Kill all parked/streaming SDK queries (host shutdown). */
 	shutdown(): void;
+	/**
+	 * Kill the queries parked for one conversation (the stream options' `sessionId`), leaving other conversations alone.
+	 * A call still in flight is not interrupted: its query is killed when the round ends. Returns how many were killed now.
+	 */
+	release(conversation: string): number;
+	/** Idle TTL (ms) for one conversation's parked queries instead of `idleTtlMs`; undefined clears it. A call may also pass `idleTtlMs` in its stream options. */
+	setIdleTtl(conversation: string, ms: number | undefined): void;
 	/** Number of live SDK queries (diagnostics/tests). */
 	readonly liveQueries: number;
 }
@@ -120,7 +127,7 @@ export function createClaudeBridgeProvider(opts: ClaudeBridgeProviderOptions = {
 		api: { stream: streamSimple as any, streamSimple: streamSimple as any },
 	} as any);
 
-	Object.assign(provider, { shutdown: () => bridge.shutdown() });
+	Object.assign(provider, { shutdown: () => bridge.shutdown(), release: (c: string) => bridge.release(c), setIdleTtl: (c: string, ms: number | undefined) => bridge.setIdleTtl(c, ms) });
 	Object.defineProperty(provider, "liveQueries", { get: () => bridge.liveCount, enumerable: true });
 	return provider as ClaudeBridgeProvider;
 }

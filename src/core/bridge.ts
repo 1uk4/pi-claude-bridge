@@ -70,6 +70,12 @@ type Live = {
 	dead: boolean;
 	ps?: PromptStream;
 	ttl?: ReturnType<typeof setTimeout>;
+	/** The host's conversation key (stream options `sessionId`); undefined when the host passes none. */
+	conversation?: string;
+	/** Idle TTL for this query's parks, overriding the provider-wide one (per-call option or per-conversation setting). */
+	ttlMs?: number;
+	/** release() arrived while a call was in flight: kill when the round ends instead of parking. */
+	releaseWhenParked?: boolean;
 };
 
 const zeroUsage = () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } });
@@ -84,6 +90,7 @@ function mapStopReason(reason: string | undefined): "stop" | "length" | "toolUse
 
 export class Bridge {
 	private lives = new Set<Live>();
+	private ttlByConversation = new Map<string, number>();
 	constructor(private opts: BridgeOptions) {}
 
 	/** Number of live (parked or streaming) SDK queries. For tests/diagnostics. */
@@ -91,6 +98,28 @@ export class Bridge {
 
 	/** Kill every live query (host shutdown / tests). */
 	shutdown(): void { for (const l of [...this.lives]) this.kill(l); }
+
+	/**
+	 * Close every query parked for `conversation` (the host's stream-options `sessionId`) and kill its claude child.
+	 * Other conversations are untouched. Safe to call with nothing parked. A query whose call is still in flight is left
+	 * alone and killed when that round ends (instead of parking). A later call for the conversation cold-starts a new query.
+	 * Returns the number of queries killed now.
+	 */
+	release(conversation: string): number {
+		let n = 0;
+		for (const l of [...this.lives]) {
+			if (l.conversation !== conversation) continue;
+			if (l.cur) l.releaseWhenParked = true;
+			else { this.kill(l); n++; }
+		}
+		return n;
+	}
+
+	/** Idle TTL for one conversation's parked queries (ms; 0 disables the TTL for it); undefined restores the provider-wide TTL. Applies from the next park. */
+	setIdleTtl(conversation: string, ms: number | undefined): void {
+		if (ms === undefined) this.ttlByConversation.delete(conversation);
+		else this.ttlByConversation.set(conversation, ms);
+	}
 
 	stream(model: Model<any>, context: TranscriptContext, options?: SimpleStreamOptions): EventStream {
 		const stream = createAssistantMessageEventStream();
@@ -122,6 +151,7 @@ export class Bridge {
 			: undefined;
 		if (parked && parked.key === key) {
 			owner.live = parked;
+			this.tag(parked, options);
 			this.continueParked(parked, round, msgs, trailing, () => this.startFresh(model, input!, round, options, owner));
 			return stream;
 		}
@@ -162,9 +192,16 @@ export class Bridge {
 				} as any,
 			});
 		} catch (e) { this.fail(round, "error", e instanceof Error ? e.message : String(e)); return; }
+		this.tag(l, options);
 		owner.live = l;
 		this.lives.add(l);
 		void this.consume(l, model);
+	}
+
+	private tag(l: Live, options: SimpleStreamOptions | undefined): void {
+		if (options?.sessionId) l.conversation = options.sessionId;
+		const perCall = (options as { idleTtlMs?: number } | undefined)?.idleTtlMs;
+		if (typeof perCall === "number") l.ttlMs = perCall;
 	}
 
 	private mcpServers(tools: Tool[], l: Live) {
@@ -215,9 +252,11 @@ export class Bridge {
 	}
 
 	private armTtl(l: Live): void {
-		if (this.opts.idleTtlMs <= 0) return;
+		if (l.releaseWhenParked) { this.kill(l); return; }
+		const ms = l.ttlMs ?? (l.conversation !== undefined ? this.ttlByConversation.get(l.conversation) : undefined) ?? this.opts.idleTtlMs;
+		if (ms <= 0) return;
 		clearTimeout(l.ttl);
-		l.ttl = setTimeout(() => this.kill(l), this.opts.idleTtlMs);
+		l.ttl = setTimeout(() => this.kill(l), ms);
 		l.ttl.unref?.();
 	}
 
