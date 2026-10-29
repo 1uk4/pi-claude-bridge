@@ -40,5 +40,6 @@ export function createStatelessProvider(opts: StatelessProviderOptions) {
 }
 export { classifyError, roundError, timeoutError, BridgeError, type ErrorClass } from "./errors.js";
 export { effortFor } from "./effort.js";
-export { makeDebug, type DebugEvent } from "./debuglog.js";
-export { makeGuard, DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_ROUND_TIMEOUT_MS } from "./provider.js";
+export { makeDebug, redact, type DebugEvent } from "./debuglog.js";
+export { DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_ROUND_TIMEOUT_MS } from "./provider.js";
+export { makeGuard, type Guard } from "./guard.js";

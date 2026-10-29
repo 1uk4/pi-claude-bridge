@@ -1,13 +1,15 @@
 // Stateless provider: one query per round, driven by a fake queryFn (no subscription use).
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, existsSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, existsSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createSession, getSessionPath } from "cc-session-io";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { isRetryableAssistantError } from "@earendil-works/pi-ai";
+import { roundError, timeoutError } from "../src/stateless/errors.js";
+import { redact } from "../src/stateless/debuglog.js";
 import { createStatelessStreams, cliSessionId, CONTINUE_PROMPT, classifyError, effortFor } from "../src/stateless/index.js";
 
 const MODEL = { id: "sonnet", api: "x", provider: "p", name: "s", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1e5, maxTokens: 1e4, reasoning: true };
@@ -65,7 +67,7 @@ describe("stateless provider", () => {
 	it("single tool call: error_max_turns + tool_use is a normal toolUse stop; one message; config is fixed", async () => {
 		const f = fake([start(), ...textBlock(0, "Let me add."), ...toolBlock(1, "toolu_1", '{"a":17,"b":25}'), delta("tool_use"), MAX_TURNS], { throwAfter: "Claude Code returned an error result: Reached maximum number of turns (1)" });
 		const { types, msg } = await run(mk(f.queryFn), [sys, user("add 17+25")]);
-		assert.deepEqual(types, ["start", "text_start", "text_delta", "text_end", "toolcall_start", "toolcall_delta", "toolcall_delta", "toolcall_end", "done"]);
+		assert.deepEqual(types, ["start", "text_start", "text_delta", "text_end", "toolcall_start", "toolcall_delta", "toolcall_end", "done"]);
 		assert.equal(msg.stopReason, "toolUse");
 		assert.deepEqual(msg.content[1], { type: "toolCall", id: "toolu_1", name: "add", arguments: { a: 17, b: 25 } });
 		assert.equal(msg.content[0].text, "Let me add.");
@@ -279,11 +281,11 @@ describe("stateless robustness: timeouts", () => {
 describe("stateless robustness: error classes, reasoning, logging", () => {
 	const errResult = (text, extra = {}) => ({ type: "result", subtype: "error_during_execution", is_error: true, errors: [text], ...extra });
 	it("rate limit / quota / overloaded -> retryable; auth / invalid request -> fatal", async () => {
-		for (const [text, extra] of [["You've hit your usage limit", { api_error_status: 429 }], ["API Error: overloaded_error", {}], ["rate limit reached", {}], ["Claude AI usage limit reached (quota exceeded, billing)", {}], ["Server error", { api_error_status: 503 }]]) {
+		for (const [text, extra] of [["API Error: overloaded_error", {}], ["rate limit reached", {}], ["Server error", { api_error_status: 503 }], ["ECONNRESET connection lost", {}]]) {
 			const { msg } = await run(mk(fake([start(), errResult(text, extra)]).queryFn), [user("x")]);
 			assert.equal(isRetryableAssistantError(msg), true, `${text} -> ${msg.errorMessage}`);
 		}
-		for (const [text, extra] of [["Invalid API key. Please run /login", { api_error_status: 401 }], ["invalid_request_error: messages.0: bad", { api_error_status: 400 }], ["authentication_failed 429", {}]]) {
+		for (const [text, extra] of [["Invalid API key. Please run /login", { api_error_status: 401 }], ["invalid_request_error: messages.0: bad", { api_error_status: 400 }], ["authentication_failed 429", {}], ["You've hit your usage limit. Resets at 5pm", { api_error_status: 429 }], ["Claude AI usage limit reached (quota exceeded, billing) resets in 3 hours", {}], ["HTTP 429 too fast", { api_error_status: 429 }]]) {
 			const { msg } = await run(mk(fake([start(), errResult(text, extra)]).queryFn), [user("x")]);
 			assert.equal(isRetryableAssistantError(msg), false, `${text} -> ${msg.errorMessage}`);
 			assert.match(msg.errorMessage, /fatal/);
@@ -331,5 +333,94 @@ describe("stateless robustness: error classes, reasoning, logging", () => {
 		const log = join(root, "dbg", "off.jsonl");
 		await run(createStatelessStreams({ sessionDir, claudeDir, queryFn: fake([start(), OK]).queryFn, debugLogPath: log }), [user("x")]);
 		assert.equal(existsSync(log), false);
+	});
+});
+
+describe("stateless robustness: review fixes", () => {
+	it("tool block closed, then message_start re-sent: no toolcall events for the abandoned call; indices match; usage not doubled", async () => {
+		const f = fake([start(), ...textBlock(0, "ab"), ...toolBlock(1, "dead", '{"a":1}'),
+			ev({ type: "message_start", message: { id: "msg2", usage: { input_tokens: 2, cache_read_input_tokens: 100, cache_creation_input_tokens: 7 } } }),
+			...textBlock(0, "final"), ...toolBlock(1, "live", '{"a":2}'), delta("tool_use"), ev({ type: "message_stop" }), MAX_TURNS]);
+		const { events, msg } = await run(mk(f.queryFn), [user("x")]);
+		const calls = events.filter((e) => e.type === "toolcall_end");
+		assert.deepEqual(calls.map((e) => e.toolCall.id), ["live"]);
+		assert.deepEqual(msg.content.map((b) => b.text ?? b.id), ["final", "live"]);
+		// every announced *_start index is unique and ends up in the final content or is an ended abandoned block
+		const starts = events.filter((e) => /_start$/.test(e.type) && e.type !== "start").map((e) => e.contentIndex);
+		assert.equal(new Set(starts).size, starts.length);
+		const ended = events.filter((e) => e.type === "text_end").map((e) => e.contentIndex);
+		assert.ok(ended.includes(0));
+		assert.equal(calls[0].contentIndex, 2); // ab(0) abandoned, final(1), live(2) -> announced indices never reused
+		assert.equal(msg.usage.input, 2); assert.equal(msg.usage.cacheRead, 100); assert.equal(msg.usage.output, 9);
+	});
+	it("a throwing consume handler leaves no running query", async () => {
+		let closed = 0, returned = 0;
+		const queryFn = () => ({ close: () => { closed++; }, [Symbol.asyncIterator]() { return this; }, return: async () => { returned++; return { done: true }; },
+			next: () => Promise.resolve({ done: false, value: { type: "stream_event", get event() { throw new Error("handler boom"); } } }) });
+		const { msg } = await run(createStatelessStreams({ sessionDir, claudeDir, queryFn }), [user("x")]);
+		assert.equal(msg.stopReason, "error");
+		assert.ok(closed >= 1); assert.equal(returned, 1);
+	});
+	it("an already-aborted signal never starts a query", async () => {
+		const c = new AbortController(); c.abort();
+		const f = fake([start(), OK]);
+		const { msg } = await run(mk(f.queryFn), [user("x")], { signal: c.signal });
+		assert.equal(msg.stopReason, "aborted"); assert.equal(f.calls.length, 0);
+	});
+	it("stop reason: toolUse beats max_tokens; max_tokens alone is length", async () => {
+		const a = await run(mk(fake([start(), ...toolBlock(0, "t", '{"a":1}'), delta("max_tokens"), MAX_TURNS]).queryFn), [user("x")]);
+		assert.equal(a.msg.stopReason, "toolUse");
+		const b = await run(mk(fake([start(), ...textBlock(0, "t"), delta("max_tokens"), OK]).queryFn), [user("x")]);
+		assert.equal(b.msg.stopReason, "length");
+	});
+	it("thinking display only for models that reason", async () => {
+		const f = fake([start(), ...textBlock(0, "k"), delta("end_turn"), OK]);
+		const s = mk(f.queryFn).streamSimple({ ...MODEL, reasoning: false }, { messages: [user("x")] }, { tools: TOOLS, sessionId: "nr", reasoning: "high" });
+		for await (const _ of s);
+		assert.equal(f.calls[0].options.extraArgs, undefined);
+	});
+	it("property: fatal text with digits and transient words stays non-retryable; raw is kept", () => {
+		const fatals = ["authentication_failed 429 overloaded 503", "Invalid API key 500 timeout connection reset", "Claude AI usage limit reached|1761700000 resets at 5pm 503", "You've hit your usage limit (429), resets in 3 hours 12345 rate limit", "max_output_tokens 502 server error"];
+		for (const t of fatals) {
+			const code = /max_output/.test(t) ? "max_output_tokens" : undefined;
+			const e = roundError(t, { code, status: /usage/.test(t) ? 429 : undefined });
+			assert.equal(e.errorClass, "fatal", t);
+			assert.equal(isRetryableAssistantError({ stopReason: "error", errorMessage: e.message }), false, e.message);
+			assert.equal(e.raw, t);
+			assert.doesNotMatch(e.message, /rate limit/i);
+		}
+		assert.match(roundError("Usage limit reached. Resets at 5pm", { status: 429 }).message, /resets at 5pm/i);
+		for (const t of ["overloaded_error available balance 0", "rate limit GoUsageLimitError", "Server error FreeUsageLimitError billing"]) {
+			const e = roundError(t, { code: "rate_limit" });
+			assert.equal(roundError("x", { code: "max_output_tokens" }).errorClass, "fatal");
+			assert.equal(e.errorClass, "retryable", t);
+			assert.equal(isRetryableAssistantError({ stopReason: "error", errorMessage: e.message }), true, e.message);
+			assert.equal(e.raw, t);
+		}
+	});
+	it("timeout wording uses the real defaults; timers cleared on throw; late timeout after dispose is harmless", async () => {
+		assert.match(timeoutError("round", 600_000).message, /within 10 min \(round timeout\)/);
+		assert.match(timeoutError("idle", 90_000).message, /for 1\.5 min|for 90 s|1\.5 min/);
+		assert.equal(isRetryableAssistantError({ stopReason: "error", errorMessage: timeoutError("round", 600_000).message }), true);
+		const queryFn = () => (async function* () { yield start(); throw new Error("kaboom"); })();
+		const { msg } = await run(createStatelessStreams({ sessionDir, claudeDir, queryFn, idleTimeoutMs: 20, roundTimeoutMs: 20 }), [user("x")]);
+		assert.match(msg.errorMessage, /kaboom/);
+		await new Promise((r) => setTimeout(r, 60)); // no unhandled rejection / second event
+	});
+	it("debug log: redaction, truncation, mode 0600, sink failure does not stop the file", async () => {
+		assert.equal(redact("Authorization: Bearer abc.def-123 x"), "Authorization: Bearer [redacted] x");
+		assert.doesNotMatch(redact("key sk-ant-api03-ABCDEFGH"), /ABCDEFGH/);
+		assert.doesNotMatch(redact('{"access_token":"s3cr3tvalue"}'), /s3cr3tvalue/);
+		assert.ok(redact("x".repeat(10000)).length < 2200);
+		const log = join(root, "dbg", "mode.jsonl");
+		const queryFn = (a) => { a.options.stderr("Bearer topsecret\n"); return fake([start(), OK]).queryFn(a); };
+		await run(createStatelessStreams({ sessionDir, claudeDir, queryFn, debug: () => { throw new Error("sink"); }, debugLogPath: log, env: {} }), [user("x")]);
+		// debug as a function alone does not enable the file; enable it via env for this check
+		process.env.CLAUDE_BRIDGE_DEBUG = "1";
+		try { await run(createStatelessStreams({ sessionDir, claudeDir, queryFn, debug: () => { throw new Error("sink"); }, debugLogPath: log }), [user("x")]); } finally { delete process.env.CLAUDE_BRIDGE_DEBUG; }
+		const txt = readFileSync(log, "utf8");
+		assert.doesNotMatch(txt, /topsecret/);
+		assert.match(txt, /round_end/);
+		assert.equal(statSync(log).mode & 0o777, 0o600);
 	});
 });
