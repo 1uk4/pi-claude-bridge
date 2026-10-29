@@ -32,7 +32,8 @@
     "test:usage": "tests/usage-test.sh",
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json",
-    "test:stateless": "node --import tsx --test tests/unit-stateless.mjs"
+    "test:stateless": "node --import tsx --test tests/unit-stateless.mjs",
+    "prepare": "npm run build"
   },
   "type": "module",
   "dependencies": {
@@ -42,14 +43,14 @@
     "change-case": "^5.4.4"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": ">=0.86.1",
+    "@earendil-works/pi-ai": ">=1.4.0",
     "@earendil-works/pi-coding-agent": ">=0.86.1",
     "@earendil-works/pi-tui": ">=0.86.1",
     "typebox": "*"
   },
   "devDependencies": {
     "@anthropic-ai/sdk": "^0.124.0",
-    "@earendil-works/pi-ai": "^1.2.0",
+    "@earendil-works/pi-ai": "^1.4.0",
     "@earendil-works/pi-coding-agent": "^1.2.0",
     "@earendil-works/pi-tui": "^1.2.0",
     "@types/node": "^24.13.2",
@@ -63,9 +64,14 @@
     ]
   },
   "exports": {
+    ".": {
+      "types": "./dist/stateless/index.d.ts",
+      "default": "./dist/stateless/index.js"
+    },
     "./stateless": {
       "types": "./dist/stateless/index.d.ts",
       "default": "./dist/stateless/index.js"
-    }
+    },
+    "./package.json": "./package.json"
   }
 }

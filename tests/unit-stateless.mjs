@@ -5,7 +5,8 @@ import { mkdtempSync, readFileSync, existsSync, rmSync, utimesSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { createSession, getSessionPath } from "cc-session-io";
-import { createStatelessStreams, cliSessionId, CONTINUE_PROMPT, patchToolResults } from "../src/stateless/index.js";
+import { getEventListeners } from "node:events";
+import { createStatelessStreams, cliSessionId, CONTINUE_PROMPT, replaySystem, childEnv, patchToolResults } from "../src/stateless/index.js";
 
 const MODEL = { id: "sonnet", api: "x", provider: "p", name: "s", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1e5, maxTokens: 1e4, reasoning: true };
 const TOOLS = [{ name: "add", description: "add", parameters: { type: "object", properties: { a: { type: "number" }, b: { type: "number" } } } }];
@@ -160,6 +161,65 @@ describe("stateless provider", () => {
 		const s = mk(fake([]).queryFn);
 		await s.forget("gone"); s.dispose();
 		assert.equal(existsSync(p), false);
+	});
+
+	it("1.4 system messages: tools only via toolsAdded reach the MCP server; removal and replacement by name", async () => {
+		const t2 = { name: "mul", description: "mul", parameters: { type: "object", properties: {} } };
+		const t1b = { ...TOOLS[0], description: "add v2" };
+		const f = fake([start(), ...textBlock(0, "x"), delta("end_turn"), OK]);
+		const msgs = [{ role: "system", content: "base", toolsAdded: [TOOLS[0], t2], timestamp: 1 }, user("hi"), { role: "system", content: "", toolsAdded: [t1b], toolsRemoved: [{ name: "mul" }], timestamp: 2 }];
+		const s = mk(f.queryFn).streamSimple(MODEL, { messages: msgs }, { sessionId: "tools14" });
+		for await (const _ of s);
+		const tools = await f.calls[0].options.mcpServers["custom-tools"].instance.server._requestHandlers.get("tools/list")({ method: "tools/list" });
+		assert.deepEqual(tools.tools.map((t) => [t.name, t.description]), [["add", "add v2"]]);
+	});
+
+	it("replaySystem: sections replace, null deletes, render after content; later content appends", () => {
+		const r = replaySystem([
+			{ role: "system", content: "base", sections: { a: "A1", b: "B1" } },
+			user("x"),
+			{ role: "system", content: [{ type: "text", text: "more" }], sections: { a: "A2", b: null, c: "C" } },
+		]);
+		assert.equal(r.prompt, "base\n\nmore\n\nA2\n\nC");
+		assert.deepEqual(r.tools, []);
+	});
+
+	it("missing sessionId fails the call", async () => {
+		const f = fake([]);
+		const s = mk(f.queryFn).streamSimple(MODEL, { messages: [user("x")] }, {});
+		const events = []; for await (const e of s) events.push(e);
+		assert.equal(events.at(-1).type, "error"); assert.match((await s.result()).errorMessage, /sessionId/);
+		assert.equal(f.calls.length, 0);
+	});
+
+	it("results whose denial record is missing: file deleted and rebuilt from the transcript", async () => {
+		const p = seedDenied("nodenial", ["other"]);
+		const f = fake([start(), ...textBlock(0, "ok"), delta("end_turn"), OK]);
+		await run(mk(f.queryFn), [sys, user("add"), asst("tz"), res("tz", "RESULT=9")], { sessionId: "nodenial" });
+		const blocks = records(p).filter((r) => r.message && Array.isArray(r.message.content)).flatMap((r) => r.message.content);
+		assert.ok(blocks.some((b) => b.type === "tool_use" && b.id === "tz"));
+		assert.ok(!blocks.some((b) => b.tool_use_id === "other"));
+		assert.equal(f.calls[0].options.resume, cliSessionId("nodenial"));
+	});
+
+	it("two trailing user messages join into one prompt", async () => {
+		const f = fake([start(), ...textBlock(0, "ok"), delta("end_turn"), OK]);
+		await run(mk(f.queryFn), [sys, user("first"), user("second")]);
+		assert.equal(f.calls[0].prompt, "first\n\nsecond");
+	});
+
+	it("abort leaves no listener on the signal", async () => {
+		const ac = new AbortController();
+		const f = fake([start(), ...textBlock(0, "ok"), delta("end_turn"), OK]);
+		await run(mk(f.queryFn), [user("x")], { signal: ac.signal });
+		assert.equal(getEventListeners(ac.signal, "abort").length, 0);
+	});
+
+	it("child env strips credentials and routing, keeps request logging off", () => {
+		const keys = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"];
+		const e = childEnv({ ...Object.fromEntries(keys.map((k) => [k, "x"])), KEEP: "1" });
+		for (const k of keys) assert.equal(e[k], undefined, k);
+		assert.equal(e.KEEP, "1"); assert.equal(e.CLAUDE_CODE_ELEGANT_MEADOW, "0");
 	});
 });
 
