@@ -1,9 +1,9 @@
 // Stateless provider: one query per round, driven by a fake queryFn (no subscription use).
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, existsSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, existsSync, rmSync, utimesSync, writeFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { createSession, getSessionPath } from "cc-session-io";
 import { createStatelessStreams, cliSessionId, CONTINUE_PROMPT, patchToolResults } from "../src/stateless/index.js";
 
@@ -158,7 +158,7 @@ describe("stateless provider", () => {
 	it("forget deletes the session file; dispose is a no-op", async () => {
 		const p = seedDenied("gone", ["t"]);
 		const s = mk(fake([]).queryFn);
-		s.forget("gone"); s.dispose();
+		await s.forget("gone"); s.dispose();
 		assert.equal(existsSync(p), false);
 	});
 });
@@ -270,7 +270,7 @@ describe("session store", () => {
 		const pf = seedDenied("fg", ["t"]);
 		writeFileSync(pf + ".tmp", "x");
 		const s = mk(fake([]).queryFn);
-		s.forget("fg");
+		await s.forget("fg");
 		assert.equal(existsSync(pf), false); assert.equal(existsSync(pf + ".tmp"), false);
 
 		const old = seedDenied("old1", ["t"]), fresh = seedDenied("fresh1", ["t"]);
@@ -296,5 +296,96 @@ describe("session store", () => {
 		utimesSync(old3, past, past);
 		withDebug(fake([]).queryFn, { sessionTtlDays: 0 });
 		assert.equal(existsSync(old3), true);
+	});
+
+	it("an aborted waiter finishes while the holder is still running", async () => {
+		let release; const gate = new Promise((r) => { release = r; });
+		let n = 0;
+		const queryFn = () => (async function* () { if (n++ === 0) await gate; for (const m of [start(), ...textBlock(0, "ok"), delta("end_turn"), OK]) yield m; })();
+		const streams = mk(queryFn);
+		const holder = run(streams, [sys, user("a")], { sessionId: "lk" });
+		await new Promise((r) => setTimeout(r, 20));
+		const ac = new AbortController();
+		const waiter = run(streams, [sys, user("b")], { sessionId: "lk", signal: ac.signal });
+		const third = run(streams, [sys, user("c")], { sessionId: "lk" });
+		setTimeout(() => ac.abort(), 20);
+		const w = await waiter; // must resolve although the holder is stuck
+		assert.equal(w.msg.stopReason, "aborted");
+		release();
+		assert.equal((await holder).msg.stopReason, "stop");
+		assert.equal((await third).msg.stopReason, "stop");
+		assert.equal(n, 2);
+	});
+
+	it("forget waits for the running round", async () => {
+		let release; const gate = new Promise((r) => { release = r; });
+		const queryFn = () => (async function* () { await gate; for (const m of [start(), ...textBlock(0, "ok"), delta("end_turn"), OK]) yield m; })();
+		const streams = mk(queryFn);
+		const p = seedDenied("fgl", ["t1"]);
+		const r = run(streams, [sys, user("add things"), asst("t1"), res("t1", "R")], { sessionId: "fgl" });
+		await new Promise((x) => setTimeout(x, 20));
+		let forgotten = false;
+		const f = streams.forget("fgl").then(() => { forgotten = true; });
+		await new Promise((x) => setTimeout(x, 30));
+		assert.equal(forgotten, false); assert.ok(existsSync(p));
+		release(); await r; await f;
+		assert.equal(existsSync(p), false);
+	});
+
+	it("aborted / errored turns leave records that do not force a rebuild", async () => {
+		const piId = "junk";
+		const p = seedDenied(piId, ["t1"]);
+		const recs = records(p);
+		const lastUser = recs.filter((r) => r.type === "user").at(-1);
+		const mkRec = (extra, msg) => ({ ...recs.at(-1), uuid: "u-" + Math.random(), parentUuid: recs.at(-1).uuid, ...extra, message: msg });
+		const extraRecs = [
+			mkRec({ type: "assistant" }, { role: "assistant", model: "<synthetic>", content: [{ type: "text", text: "API Error" }] }),
+			mkRec({ type: "assistant", isApiErrorMessage: true }, { role: "assistant", content: [{ type: "text", text: "boom" }] }),
+			mkRec({ type: "assistant" }, { role: "assistant", content: [{ type: "thinking", thinking: "hm", signature: "s" }], stop_reason: null }),
+			mkRec({ type: "user", isMeta: true }, { role: "user", content: [{ type: "text", text: "meta" }] }),
+		];
+		void lastUser;
+		writeFileSync(p, [...recs, ...extraRecs].map((r) => JSON.stringify(r)).join("\n") + "\n");
+		const f = okFake();
+		const { streams, log } = withDebug(f.queryFn);
+		await run(streams, [sys, user("add things"), asst("t1"), res("t1", "RESULT=1")], { sessionId: piId });
+		assert.ok(!log.some((l) => l.includes("rebuilding")), log.join("|"));
+		assert.ok(JSON.stringify(toolResults(p)).includes("RESULT=1"));
+	});
+
+	it("split assistant records (thinking, then text + tool_use) verify; a retry of a patched round does not rebuild", async () => {
+		const piId = "split";
+		const p = seedDenied(piId, ["t1"]);
+		const recs = records(p);
+		const ai = recs.findIndex((r) => r.type === "assistant");
+		const a = recs[ai];
+		const think = { ...a, uuid: "think-1", parentUuid: a.parentUuid, message: { ...a.message, content: [{ type: "thinking", thinking: "hm", signature: "s" }] } };
+		recs[ai] = { ...a, parentUuid: "think-1" };
+		recs.splice(ai, 0, think);
+		writeFileSync(p, recs.map((r) => JSON.stringify(r)).join("\n") + "\n");
+		const msgs = [sys, user("add things"), asst("t1"), res("t1", "RESULT=1")];
+		const f = okFake();
+		const { streams, log } = withDebug(f.queryFn);
+		await run(streams, msgs, { sessionId: piId });
+		await run(streams, msgs, { sessionId: piId }); // retry of the same, already patched round
+		assert.ok(!log.some((l) => l.includes("rebuilding")), log.join("|"));
+		assert.deepEqual(toolResults(p).map((b) => b.content), ["RESULT=1"]);
+		assert.equal(f.calls.length, 2);
+	});
+
+	it("a verified file is touched so the sweep cannot take it", async () => {
+		const p = seedDenied("touch", ["t1"]);
+		const past = new Date(Date.now() - 8 * 86_400_000);
+		utimesSync(p, past, past);
+		await run(mk(okFake().queryFn), [sys, user("add things"), asst("t1"), res("t1", "R")], { sessionId: "touch" });
+		assert.ok(Date.now() - statSync(p).mtimeMs < 60_000);
+	});
+
+	it("sweep ignores files that are not uuid-named sessions", async () => {
+		const odd = join(dirname(seedDenied("oddref", ["t"])), "notes.jsonl");
+		const past = new Date(Date.now() - 30 * 86_400_000);
+		writeFileSync(odd, "x"); utimesSync(odd, past, past);
+		withDebug(fake([]).queryFn, { now: () => Date.now() + 10 * 3_600_000 });
+		assert.equal(existsSync(odd), true);
 	});
 });

@@ -12,7 +12,7 @@
 // Every tool call is denied by a PreToolUse hook: pi runs the tools, never Claude Code.
 
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, utimesSync } from "node:fs";
 import { dirname } from "node:path";
 import { query as sdkQuery, type Options } from "@anthropic-ai/claude-agent-sdk";
 import { createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEventStream, type Message, type Model, type SimpleStreamOptions } from "@earendil-works/pi-ai";
@@ -94,7 +94,9 @@ export function createStatelessStreams(opts: StatelessStreamOptions) {
 		let q: (AsyncIterable<any> & { close?: () => void }) | undefined;
 		let aborted = false;
 		let release: (() => void) | undefined;
-		const onAbort = () => { aborted = true; abort.abort(); try { q?.close?.(); } catch { /* already gone */ } };
+		let signalAbort!: () => void;
+		const abortedP = new Promise<void>((r) => { signalAbort = r; });
+		const onAbort = () => { aborted = true; signalAbort(); abort.abort(); try { q?.close?.(); } catch { /* already gone */ } };
 		options?.signal?.addEventListener("abort", onAbort, { once: true });
 
 		const fail = (reason: "error" | "aborted", message: string) => {
@@ -115,7 +117,10 @@ export function createStatelessStreams(opts: StatelessStreamOptions) {
 				const toolNames = new Map(tools.map((t: any) => [t.name, `${MCP_TOOL_PREFIX}${t.name}`]));
 
 				// One round at a time per session: verify, patch and the query itself.
-				release = await lock(sid);
+				// An abort while waiting must end this round now, not when the holder finishes.
+				const held = lock(sid);
+				release = held.cancel;
+				await Promise.race([held.acquired, abortedP]);
 				if (aborted) return fail("aborted", "aborted");
 				sweep();
 
@@ -138,7 +143,7 @@ export function createStatelessStreams(opts: StatelessStreamOptions) {
 				if (existsSync(path)) {
 					const mapId = (id: string) => sanitizedIds.get(id) ?? id;
 					const resultIds = [...plan.results.keys()].map(mapId);
-					let reason = verifyAgainst(path, logicalFromMessages(anthropicMessages as any, mapId), resultIds);
+					let reason = verifyAgainst(path, logicalFromMessages(repairToolPairing(anthropicMessages as any) as any, mapId), resultIds);
 					if (!reason && plan.results.size) {
 						try {
 							const patched = patchToolResults(path, new Map([...plan.results].map(([k, v]) => [mapId(k), v])), { requireAll: true, beforeRename: opts.patchHook });
@@ -146,6 +151,7 @@ export function createStatelessStreams(opts: StatelessStreamOptions) {
 							else dbg(`patched ${patched.length}/${plan.results.size} tool results`);
 						} catch (e: any) { reason = `patch failed: ${e?.message ?? e}`; }
 					}
+					if (!reason) { try { const t = new Date(now()); utimesSync(path, t, t); } catch { /* sweep guard only */ } }
 					resume = reason ? rebuild(reason) : true;
 				} else {
 					// Missing file is normal (first round, sweep, forget): build it from the transcript.
@@ -195,11 +201,15 @@ export function createStatelessStreams(opts: StatelessStreamOptions) {
 	return {
 		stream: streamSimple,
 		streamSimple,
-		/** Delete the session file for a pi session id. */
-		forget(piSessionId: string): void {
+		/** Delete the session file for a pi session id, after any round running on it has finished. */
+		async forget(piSessionId: string): Promise<void> {
 			const sid = cliSessionId(piSessionId);
-			try { deleteSession(sid, opts.sessionDir, opts.claudeDir); } catch { /* none */ }
-			removeSessionFiles(fileFor(sid));
+			const held = lock(sid);
+			try {
+				await held.acquired;
+				try { deleteSession(sid, opts.sessionDir, opts.claudeDir); } catch { /* none */ }
+				removeSessionFiles(fileFor(sid));
+			} finally { held.cancel(); }
 		},
 		/** Nothing is held between calls. */
 		dispose(): void {},
