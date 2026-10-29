@@ -1,16 +1,17 @@
 // Stateless provider: one query per round, driven by a fake queryFn (no subscription use).
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, existsSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, existsSync, rmSync, utimesSync, writeFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { createSession, getSessionPath } from "cc-session-io";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { isRetryableAssistantError } from "@earendil-works/pi-ai";
+import { getEventListeners } from "node:events";
 import { roundError, timeoutError } from "../src/stateless/errors.js";
 import { redact } from "../src/stateless/debuglog.js";
-import { createStatelessStreams, cliSessionId, CONTINUE_PROMPT, classifyError, effortFor } from "../src/stateless/index.js";
+import { createStatelessStreams, cliSessionId, CONTINUE_PROMPT, classifyError, effortFor, replaySystem, childEnv, patchToolResults } from "../src/stateless/index.js";
 
 const MODEL = { id: "sonnet", api: "x", provider: "p", name: "s", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1e5, maxTokens: 1e4, reasoning: true };
 const TOOLS = [{ name: "add", description: "add", parameters: { type: "object", properties: { a: { type: "number" }, b: { type: "number" } } } }];
@@ -163,8 +164,310 @@ describe("stateless provider", () => {
 	it("forget deletes the session file; dispose is a no-op", async () => {
 		const p = seedDenied("gone", ["t"]);
 		const s = mk(fake([]).queryFn);
-		s.forget("gone"); s.dispose();
+		await s.forget("gone"); s.dispose();
 		assert.equal(existsSync(p), false);
+	});
+
+	it("1.4 system messages: tools only via toolsAdded reach the MCP server; removal and replacement by name", async () => {
+		const t2 = { name: "mul", description: "mul", parameters: { type: "object", properties: {} } };
+		const t1b = { ...TOOLS[0], description: "add v2" };
+		const f = fake([start(), ...textBlock(0, "x"), delta("end_turn"), OK]);
+		const msgs = [{ role: "system", content: "base", toolsAdded: [TOOLS[0], t2], timestamp: 1 }, user("hi"), { role: "system", content: "", toolsAdded: [t1b], toolsRemoved: [{ name: "mul" }], timestamp: 2 }];
+		const s = mk(f.queryFn).streamSimple(MODEL, { messages: msgs }, { sessionId: "tools14" });
+		for await (const _ of s);
+		const tools = await f.calls[0].options.mcpServers["custom-tools"].instance.server._requestHandlers.get("tools/list")({ method: "tools/list" });
+		assert.deepEqual(tools.tools.map((t) => [t.name, t.description]), [["add", "add v2"]]);
+	});
+
+	it("a redefined tool (removal + addition of the same name in one message) survives", async () => {
+		const v2 = { ...TOOLS[0], description: "add v2" };
+		const f = fake([start(), ...textBlock(0, "x"), delta("end_turn"), OK]);
+		const msgs = [{ role: "system", content: "base", toolsAdded: [TOOLS[0]], timestamp: 1 }, user("hi"), { role: "system", content: "", toolsRemoved: [{ name: "add" }], toolsAdded: [v2], timestamp: 2 }];
+		for await (const _ of mk(f.queryFn).streamSimple(MODEL, { messages: msgs }, { sessionId: "redef" }));
+		const tools = await f.calls[0].options.mcpServers["custom-tools"].instance.server._requestHandlers.get("tools/list")({ method: "tools/list" });
+		assert.deepEqual(tools.tools.map((t) => [t.name, t.description]), [["add", "add v2"]]);
+	});
+
+	it("removing every tool leaves zero tools; the options.tools fallback is ignored once tools were declared", async () => {
+		const f = fake([start(), ...textBlock(0, "x"), delta("end_turn"), OK]);
+		const msgs = [{ role: "system", content: "base", toolsAdded: [TOOLS[0]], timestamp: 1 }, user("hi"), { role: "system", content: "", toolsRemoved: [{ name: "add" }], timestamp: 2 }];
+		for await (const _ of mk(f.queryFn).streamSimple(MODEL, { messages: msgs, tools: TOOLS }, { sessionId: "rmall", tools: TOOLS }));
+		assert.equal(f.calls[0].options.mcpServers?.["custom-tools"], undefined);
+	});
+
+	it("replaySystem: sections replace, null deletes, render after content; later content appends", () => {
+		const r = replaySystem([
+			{ role: "system", content: "base", sections: { a: "A1", b: "B1" } },
+			user("x"),
+			{ role: "system", content: [{ type: "text", text: "more" }], sections: { a: "A2", b: null, c: "C" } },
+		]);
+		assert.equal(r.prompt, "base\n\nmore\n\nA2\n\nC");
+		assert.deepEqual(r.tools, []);
+	});
+
+	it("missing sessionId fails the call", async () => {
+		const f = fake([]);
+		const s = mk(f.queryFn).streamSimple(MODEL, { messages: [user("x")] }, {});
+		const events = []; for await (const e of s) events.push(e);
+		assert.equal(events.at(-1).type, "error"); assert.match((await s.result()).errorMessage, /sessionId/);
+		assert.equal(f.calls.length, 0);
+	});
+
+	it("results whose denial record is missing: file deleted and rebuilt from the transcript", async () => {
+		const p = seedDenied("nodenial", ["other"]);
+		const f = fake([start(), ...textBlock(0, "ok"), delta("end_turn"), OK]);
+		await run(mk(f.queryFn), [sys, user("add"), asst("tz"), res("tz", "RESULT=9")], { sessionId: "nodenial" });
+		const blocks = records(p).filter((r) => r.message && Array.isArray(r.message.content)).flatMap((r) => r.message.content);
+		assert.ok(blocks.some((b) => b.type === "tool_use" && b.id === "tz"));
+		assert.ok(!blocks.some((b) => b.tool_use_id === "other"));
+		assert.equal(f.calls[0].options.resume, cliSessionId("nodenial"));
+	});
+
+	it("two trailing user messages join into one prompt", async () => {
+		const f = fake([start(), ...textBlock(0, "ok"), delta("end_turn"), OK]);
+		await run(mk(f.queryFn), [sys, user("first"), user("second")]);
+		assert.equal(f.calls[0].prompt, "first\n\nsecond");
+	});
+
+	it("abort leaves no listener on the signal", async () => {
+		const ac = new AbortController();
+		const f = fake([start(), ...textBlock(0, "ok"), delta("end_turn"), OK]);
+		await run(mk(f.queryFn), [user("x")], { signal: ac.signal });
+		assert.equal(getEventListeners(ac.signal, "abort").length, 0);
+	});
+
+	it("child env strips credentials and routing, keeps request logging off", () => {
+		const keys = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"];
+		const e = childEnv({ ...Object.fromEntries(keys.map((k) => [k, "x"])), KEEP: "1" });
+		for (const k of keys) assert.equal(e[k], undefined, k);
+		assert.equal(e.KEEP, "1"); assert.equal(e.CLAUDE_CODE_ELEGANT_MEADOW, "0");
+	});
+});
+
+describe("session store", () => {
+	const okFake = () => fake([start(), ...textBlock(0, "ok"), delta("end_turn"), OK]);
+	const withDebug = (queryFn, extra = {}) => { const log = []; return { streams: createStatelessStreams({ sessionDir, claudeDir, queryFn, debug: (e) => { if (e.event === "note") log.push(e.msg); }, ...extra }), log }; };
+	const toolResults = (p) => records(p).filter((r) => r.type === "user" && Array.isArray(r.message?.content)).flatMap((r) => r.message.content).filter((b) => b.type === "tool_result");
+
+	it("recovery while a tool_result is pending: file deleted -> rebuilt from the transcript, round works", async () => {
+		const p = seedDenied("lost", ["t1"]);
+		rmSync(p);
+		const f = okFake();
+		const { streams, log } = withDebug(f.queryFn);
+		const { msg } = await run(streams, [sys, user("add things"), asst("t1"), res("t1", "RESULT=5")], { sessionId: "lost" });
+		assert.equal(msg.stopReason, "stop");
+		assert.ok(existsSync(p));
+		assert.deepEqual(toolResults(p).map((b) => b.tool_use_id), ["t1"]);
+		assert.ok(JSON.stringify(toolResults(p)[0].content).includes("RESULT=5"));
+		assert.equal(f.calls[0].options.resume, cliSessionId("lost"));
+		assert.ok(log.some((l) => l.startsWith("built session")));
+	});
+
+	it("steer while results are pending: matching file is verified and patched, no rebuild", async () => {
+		const p = seedDenied("steer2", ["a", "b"]);
+		const f = okFake();
+		const { streams, log } = withDebug(f.queryFn);
+		await run(streams, [sys, user("add things"), asst("a", "b"), res("a", "R1"), res("b", "R2"), user("also do X")], { sessionId: "steer2" });
+		assert.equal(f.calls[0].prompt, "also do X");
+		assert.ok(!log.some((l) => l.includes("rebuilding")), log.join("|"));
+		assert.deepEqual(toolResults(p).map((b) => b.content), ["R1", "R2"]);
+	});
+
+	it("mismatch (different tool_use ids / message count) -> rebuild, reason reported", async () => {
+		const p = seedDenied("mism", ["old"]);
+		const f = okFake();
+		const { streams, log } = withDebug(f.queryFn);
+		await run(streams, [sys, user("add things"), asst("new"), res("new", "RESULT=9")], { sessionId: "mism" });
+		assert.ok(log.some((l) => l.includes("rebuilding session") && l.includes("tool_use ids differ")), log.join("|"));
+		assert.deepEqual(toolResults(p).map((b) => b.tool_use_id), ["new"]);
+		// extra history in the transcript -> count mismatch
+		const f2 = okFake();
+		const d2 = withDebug(f2.queryFn);
+		await run(d2.streams, [sys, user("add things"), asst("new"), res("new", "R"), user("more")], { sessionId: "mism" });
+		await run(d2.streams, [sys, user("add things"), asst("new"), res("new", "R"), user("more"), asst("n2"), res("n2", "R2")], { sessionId: "mism" });
+		assert.ok(d2.log.some((l) => l.includes("message count")), d2.log.join("|"));
+	});
+
+	it("denial record missing in the file -> falls back to a rebuild instead of failing", async () => {
+		const p = seedDenied("nodenial", ["t1"]);
+		writeFileSync(p, records(p).filter((r) => !(r.type === "user" && JSON.stringify(r).includes("denied by hook"))).map((r) => JSON.stringify(r)).join("\n") + "\n");
+		const f = okFake();
+		const { streams, log } = withDebug(f.queryFn);
+		const { msg } = await run(streams, [sys, user("add things"), asst("t1"), res("t1", "RESULT=1")], { sessionId: "nodenial" });
+		assert.equal(msg.stopReason, "stop");
+		assert.ok(log.some((l) => l.includes("rebuilding")));
+		assert.ok(JSON.stringify(toolResults(p)).includes("RESULT=1"));
+	});
+
+	it("a large (~200 KB) result is patched intact", async () => {
+		const p = seedDenied("big", ["t1"]);
+		const big = "x".repeat(200_000) + "END";
+		const f = okFake();
+		const { streams, log } = withDebug(f.queryFn);
+		await run(streams, [sys, user("add things"), asst("t1"), res("t1", big)], { sessionId: "big" });
+		assert.ok(!log.some((l) => l.includes("rebuilding")));
+		assert.equal(toolResults(p)[0].content, big);
+	});
+
+	it("crash during the patch write: temp left behind, original intact; the next round recovers", async () => {
+		const p = seedDenied("crash", ["t1"]);
+		const orig = readFileSync(p, "utf8");
+		assert.throws(() => patchToolResults(p, new Map([["t1", { content: "R" }]]), { beforeRename: () => { throw new Error("power cut"); } }), /power cut/);
+		assert.equal(readFileSync(p, "utf8"), orig);
+		assert.ok(existsSync(p + ".tmp"));
+		const f = okFake();
+		const { streams, log } = withDebug(f.queryFn);
+		await run(streams, [sys, user("add things"), asst("t1"), res("t1", "RESULT=2")], { sessionId: "crash" });
+		assert.ok(!log.some((l) => l.includes("rebuilding")));
+		assert.equal(toolResults(p)[0].content, "RESULT=2");
+		assert.equal(existsSync(p + ".tmp"), false);
+		// a crash inside a round falls back to a rebuild
+		const p2 = seedDenied("crash2", ["t1"]);
+		const d2 = withDebug(okFake().queryFn, { patchHook: () => { throw new Error("disk full"); } });
+		const r = await run(d2.streams, [sys, user("add things"), asst("t1"), res("t1", "RESULT=3")], { sessionId: "crash2" });
+		assert.equal(r.msg.stopReason, "stop");
+		assert.ok(d2.log.some((l) => l.includes("patch failed: disk full")));
+		assert.ok(JSON.stringify(toolResults(p2)).includes("RESULT=3"));
+	});
+
+	it("concurrent rounds on one session serialize; different sessions do not", async () => {
+		const seen = [];
+		let active = 0, maxActive = 0;
+		const queryFn = (args) => (async function* () {
+			active++; maxActive = Math.max(maxActive, active); seen.push("start");
+			await new Promise((r) => setTimeout(r, 40));
+			for (const m of [start(), ...textBlock(0, "ok"), delta("end_turn"), OK]) yield m;
+			seen.push("end"); active--;
+		})();
+		const streams = mk(queryFn);
+		await Promise.all([1, 2, 3].map(() => run(streams, [sys, user("hi")], { sessionId: "same" })));
+		assert.equal(maxActive, 1); assert.deepEqual(seen, ["start", "end", "start", "end", "start", "end"]);
+		maxActive = 0;
+		await Promise.all([run(streams, [sys, user("hi")], { sessionId: "o1" }), run(streams, [sys, user("hi")], { sessionId: "o2" })]);
+		assert.equal(maxActive, 2);
+	});
+
+	it("forget removes file and temp leftovers; idle sweep removes only stale sessions, at most hourly", async () => {
+		const pf = seedDenied("fg", ["t"]);
+		writeFileSync(pf + ".tmp", "x");
+		const s = mk(fake([]).queryFn);
+		await s.forget("fg");
+		assert.equal(existsSync(pf), false); assert.equal(existsSync(pf + ".tmp"), false);
+
+		const old = seedDenied("old1", ["t"]), fresh = seedDenied("fresh1", ["t"]);
+		writeFileSync(old + ".tmp", "x");
+		const past = new Date(Date.now() - 8 * 86_400_000);
+		utimesSync(old, past, past); utimesSync(old + ".tmp", past, past);
+		let t = Date.now();
+		const { streams, log } = withDebug(fake([]).queryFn, { now: () => t });
+		assert.equal(existsSync(old), false); assert.equal(existsSync(old + ".tmp"), false);
+		assert.equal(existsSync(fresh), true);
+		assert.ok(log.some((l) => l.includes("idle sweep removed")));
+		// not again within the hour
+		const old2 = seedDenied("old2", ["t"]);
+		utimesSync(old2, past, past);
+		t += 30 * 60_000;
+		await run(streams, [sys, user("hi")], { sessionId: "sw" });
+		assert.equal(existsSync(old2), true);
+		t += 31 * 60_000;
+		await run(streams, [sys, user("hi")], { sessionId: "sw" });
+		assert.equal(existsSync(old2), false);
+		// ttl 0 disables
+		const old3 = seedDenied("old3", ["t"]);
+		utimesSync(old3, past, past);
+		withDebug(fake([]).queryFn, { sessionTtlDays: 0 });
+		assert.equal(existsSync(old3), true);
+	});
+
+	it("an aborted waiter finishes while the holder is still running", async () => {
+		let release; const gate = new Promise((r) => { release = r; });
+		let n = 0;
+		const queryFn = () => (async function* () { if (n++ === 0) await gate; for (const m of [start(), ...textBlock(0, "ok"), delta("end_turn"), OK]) yield m; })();
+		const streams = mk(queryFn);
+		const holder = run(streams, [sys, user("a")], { sessionId: "lk" });
+		await new Promise((r) => setTimeout(r, 20));
+		const ac = new AbortController();
+		const waiter = run(streams, [sys, user("b")], { sessionId: "lk", signal: ac.signal });
+		const third = run(streams, [sys, user("c")], { sessionId: "lk" });
+		setTimeout(() => ac.abort(), 20);
+		const w = await waiter; // must resolve although the holder is stuck
+		assert.equal(w.msg.stopReason, "aborted");
+		release();
+		assert.equal((await holder).msg.stopReason, "stop");
+		assert.equal((await third).msg.stopReason, "stop");
+		assert.equal(n, 2);
+	});
+
+	it("forget waits for the running round", async () => {
+		let release; const gate = new Promise((r) => { release = r; });
+		const queryFn = () => (async function* () { await gate; for (const m of [start(), ...textBlock(0, "ok"), delta("end_turn"), OK]) yield m; })();
+		const streams = mk(queryFn);
+		const p = seedDenied("fgl", ["t1"]);
+		const r = run(streams, [sys, user("add things"), asst("t1"), res("t1", "R")], { sessionId: "fgl" });
+		await new Promise((x) => setTimeout(x, 20));
+		let forgotten = false;
+		const f = streams.forget("fgl").then(() => { forgotten = true; });
+		await new Promise((x) => setTimeout(x, 30));
+		assert.equal(forgotten, false); assert.ok(existsSync(p));
+		release(); await r; await f;
+		assert.equal(existsSync(p), false);
+	});
+
+	it("aborted / errored turns leave records that do not force a rebuild", async () => {
+		const piId = "junk";
+		const p = seedDenied(piId, ["t1"]);
+		const recs = records(p);
+		const lastUser = recs.filter((r) => r.type === "user").at(-1);
+		const mkRec = (extra, msg) => ({ ...recs.at(-1), uuid: "u-" + Math.random(), parentUuid: recs.at(-1).uuid, ...extra, message: msg });
+		const extraRecs = [
+			mkRec({ type: "assistant" }, { role: "assistant", model: "<synthetic>", content: [{ type: "text", text: "API Error" }] }),
+			mkRec({ type: "assistant", isApiErrorMessage: true }, { role: "assistant", content: [{ type: "text", text: "boom" }] }),
+			mkRec({ type: "assistant" }, { role: "assistant", content: [{ type: "thinking", thinking: "hm", signature: "s" }], stop_reason: null }),
+			mkRec({ type: "user", isMeta: true }, { role: "user", content: [{ type: "text", text: "meta" }] }),
+		];
+		void lastUser;
+		writeFileSync(p, [...recs, ...extraRecs].map((r) => JSON.stringify(r)).join("\n") + "\n");
+		const f = okFake();
+		const { streams, log } = withDebug(f.queryFn);
+		await run(streams, [sys, user("add things"), asst("t1"), res("t1", "RESULT=1")], { sessionId: piId });
+		assert.ok(!log.some((l) => l.includes("rebuilding")), log.join("|"));
+		assert.ok(JSON.stringify(toolResults(p)).includes("RESULT=1"));
+	});
+
+	it("split assistant records (thinking, then text + tool_use) verify; a retry of a patched round does not rebuild", async () => {
+		const piId = "split";
+		const p = seedDenied(piId, ["t1"]);
+		const recs = records(p);
+		const ai = recs.findIndex((r) => r.type === "assistant");
+		const a = recs[ai];
+		const think = { ...a, uuid: "think-1", parentUuid: a.parentUuid, message: { ...a.message, content: [{ type: "thinking", thinking: "hm", signature: "s" }] } };
+		recs[ai] = { ...a, parentUuid: "think-1" };
+		recs.splice(ai, 0, think);
+		writeFileSync(p, recs.map((r) => JSON.stringify(r)).join("\n") + "\n");
+		const msgs = [sys, user("add things"), asst("t1"), res("t1", "RESULT=1")];
+		const f = okFake();
+		const { streams, log } = withDebug(f.queryFn);
+		await run(streams, msgs, { sessionId: piId });
+		await run(streams, msgs, { sessionId: piId }); // retry of the same, already patched round
+		assert.ok(!log.some((l) => l.includes("rebuilding")), log.join("|"));
+		assert.deepEqual(toolResults(p).map((b) => b.content), ["RESULT=1"]);
+		assert.equal(f.calls.length, 2);
+	});
+
+	it("a verified file is touched so the sweep cannot take it", async () => {
+		const p = seedDenied("touch", ["t1"]);
+		const past = new Date(Date.now() - 8 * 86_400_000);
+		utimesSync(p, past, past);
+		await run(mk(okFake().queryFn), [sys, user("add things"), asst("t1"), res("t1", "R")], { sessionId: "touch" });
+		assert.ok(Date.now() - statSync(p).mtimeMs < 60_000);
+	});
+
+	it("sweep ignores files that are not uuid-named sessions", async () => {
+		const odd = join(dirname(seedDenied("oddref", ["t"])), "notes.jsonl");
+		const past = new Date(Date.now() - 30 * 86_400_000);
+		writeFileSync(odd, "x"); utimesSync(odd, past, past);
+		withDebug(fake([]).queryFn, { now: () => Date.now() + 10 * 3_600_000 });
+		assert.equal(existsSync(odd), true);
 	});
 });
 

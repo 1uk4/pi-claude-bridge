@@ -12,10 +12,11 @@
 // Every tool call is denied by a PreToolUse hook: pi runs the tools, never Claude Code.
 
 import { createHash } from "node:crypto";
-import { existsSync, rmSync } from "node:fs";
+import { existsSync, utimesSync } from "node:fs";
+import { dirname } from "node:path";
 import { query as sdkQuery, type Options } from "@anthropic-ai/claude-agent-sdk";
 import { createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEventStream, type Message, type Model, type SimpleStreamOptions } from "@earendil-works/pi-ai";
-import { createSession, deleteSession, getSessionPath } from "cc-session-io";
+import { createSession, deleteSession, getSessionPath, repairToolPairing } from "cc-session-io";
 import { convertPiMessages } from "../convert.js";
 import { createToolServer } from "../mcp-server.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX } from "../skills.js";
@@ -27,6 +28,7 @@ import { BridgeError, roundError } from "./errors.js";
 import { makeGuard, type Guard } from "./guard.js";
 import { patchToolResults } from "./patch.js";
 import { CONTINUE_PROMPT, planRound } from "./plan.js";
+import { createLocks, logicalFromMessages, removeSessionFiles, sweepIdle, verifyAgainst } from "./store.js";
 
 export type QueryFn = (args: { prompt: string; options: Options }) => AsyncIterable<any> & { close?: () => void };
 
@@ -51,6 +53,12 @@ export interface StatelessStreamOptions {
 	idleTimeoutMs?: number;
 	/** Kill the query when the round takes longer than this in total. Default 600 000 ms. */
 	roundTimeoutMs?: number;
+	/** Session files untouched for this many days are deleted (checked at creation, then at most hourly). Default 7; 0 disables. */
+	sessionTtlDays?: number;
+	/** Clock, injectable for tests. */
+	now?: () => number;
+	/** Test seam: runs after the patch temp file is written, before the rename. */
+	patchHook?: () => void;
 }
 
 interface RoundLog { sessionId: string; promptKind: string; firstEventMs: number | undefined; stopReason: string | undefined; kill: "idle" | "round" | undefined; errorClass?: string; raw?: string }
@@ -81,6 +89,20 @@ export function createStatelessStreams(opts: StatelessStreamOptions) {
 	/** Debug hook: dbg(event) or dbg("note"). The session-store code calls this for verify/rebuild/patch events. */
 	const dbg = makeDebug(opts);
 	const fileFor = (sid: string) => getSessionPath(sid, opts.sessionDir, opts.claudeDir);
+	const lock = createLocks();
+	const now = opts.now ?? Date.now;
+	const ttlMs = (opts.sessionTtlDays ?? 7) * 86_400_000;
+	let lastSweep = -Infinity;
+	const sweep = () => {
+		const t = now();
+		if (t - lastSweep < 3_600_000) return;
+		lastSweep = t;
+		try {
+			const n = sweepIdle(dirname(fileFor("00000000-0000-4000-8000-000000000000")), ttlMs, t);
+			if (n) dbg(`idle sweep removed ${n} session file(s)`);
+		} catch (e: any) { dbg(`idle sweep failed: ${e?.message ?? e}`); }
+	};
+	sweep();
 
 	function streamSimple(model: Model<any>, context: { messages: Message[]; tools?: any[] }, options?: SimpleStreamOptions & { tools?: any[]; sessionId?: string }): AssistantMessageEventStream {
 		const stream = createAssistantMessageEventStream();
@@ -90,10 +112,13 @@ export function createStatelessStreams(opts: StatelessStreamOptions) {
 		let aborted = false;
 		let killed = false;
 		const killQuery = () => { if (killed) return; killed = true; abort.abort(); try { q?.close?.(); } catch { /* already gone */ } };
-		const onAbort = () => { aborted = true; killQuery(); };
+		const onAbort = () => { aborted = true; signalAbort(); killQuery(); };
 		const t0 = Date.now();
 		const round: RoundLog = { sessionId: "", promptKind: "", firstEventMs: undefined, stopReason: undefined, kill: undefined };
 		let guard: Guard | undefined;
+		let release: (() => void) | undefined;
+		let signalAbort!: () => void;
+		const abortedP = new Promise<void>((r) => { signalAbort = r; });
 		options?.signal?.addEventListener("abort", onAbort, { once: true });
 		if (options?.signal?.aborted) onAbort();
 
@@ -107,9 +132,11 @@ export function createStatelessStreams(opts: StatelessStreamOptions) {
 		void (async () => {
 			try {
 				if (options?.signal?.aborted) return fail("aborted", "aborted");
-				const tools = options?.tools ?? context.tools ?? [];
 				const plan = planRound(context.messages);
-				const piSessionId = options?.sessionId ?? "default";
+				// pi-ai 1.4 delivers tools on system messages; options/context.tools is the 1.2 fallback.
+				const tools = plan.toolsDeclared ? plan.tools : (options?.tools ?? context.tools ?? []);
+				const piSessionId = options?.sessionId;
+				if (!piSessionId) return fail("error", "stateless provider: options.sessionId is required (one session file per pi session)");
 				const sid = cliSessionId(piSessionId);
 				round.sessionId = sid;
 				const path = fileFor(sid);
@@ -119,29 +146,48 @@ export function createStatelessStreams(opts: StatelessStreamOptions) {
 				round.promptKind = plan.promptText ? "user" : plan.results.size ? "tool_results" : "continue";
 				const effort = effortFor(model, options?.reasoning);
 
+				// One round at a time per session: verify, patch and the query itself.
+				// An abort while waiting must end this round now, not when the holder finishes.
+				const held = lock(sid);
+				release = held.cancel;
+				await Promise.race([held.acquired, abortedP]);
+				if (aborted) return fail("aborted", "aborted");
+				sweep();
+
+				const { anthropicMessages, sanitizedIds } = plan.importable.length
+					? convertPiMessages(plan.importable, toolNames)
+					: { anthropicMessages: [] as any[], sanitizedIds: new Map<string, string>() };
+				const build = () => {
+					removeSessionFiles(path);
+					if (!plan.importable.length) return false;
+					const session = createSession({ projectPath: opts.sessionDir, sessionId: sid, claudeDir: opts.claudeDir, model: opts.cliModelId?.(model) ?? model.id });
+					session.importMessages(repairToolPairing(anthropicMessages as any) as any);
+					session.save();
+					dbg(`built session ${sid} from ${plan.importable.length} messages`);
+					return true;
+				};
+				const rebuild = (reason: string) => { dbg(`rebuilding session ${sid}: ${reason}`); return build(); };
+
 				let prompt: string;
 				let resume = false;
 				if (existsSync(path)) {
-					// TODO(session-store ticket): verify the file against the transcript here
-					// (history length/ids match, denial records present) and rebuild on mismatch.
-					resume = true;
-					if (plan.results.size) {
-						const patched = patchToolResults(path, plan.results);
-						dbg(`patched ${patched.length}/${plan.results.size} tool results`);
+					const mapId = (id: string) => sanitizedIds.get(id) ?? id;
+					const resultIds = [...plan.results.keys()].map(mapId);
+					let reason = verifyAgainst(path, logicalFromMessages(repairToolPairing(anthropicMessages as any) as any, mapId), resultIds);
+					if (!reason && plan.results.size) {
+						try {
+							const patched = patchToolResults(path, new Map([...plan.results].map(([k, v]) => [mapId(k), v])), { requireAll: true, beforeRename: opts.patchHook });
+							if (patched.length < plan.results.size) reason = `denial record not found (${patched.length}/${plan.results.size})`;
+							else dbg(`patched ${patched.length}/${plan.results.size} tool results`);
+						} catch (e: any) { reason = `patch failed: ${e?.message ?? e}`; }
 					}
-					prompt = plan.promptText ?? (plan.results.size ? (opts.continuePrompt ?? CONTINUE_PROMPT) : (opts.continuePrompt ?? CONTINUE_PROMPT));
+					if (!reason) { try { const t = new Date(now()); utimesSync(path, t, t); } catch { /* sweep guard only */ } }
+					resume = reason ? rebuild(reason) : true;
 				} else {
-					// Missing file: build it from the transcript (real tool_use/tool_result records).
-					if (plan.importable.length) {
-						const { anthropicMessages } = convertPiMessages(plan.importable, toolNames);
-						const session = createSession({ projectPath: opts.sessionDir, sessionId: sid, claudeDir: opts.claudeDir, model: opts.cliModelId?.(model) ?? model.id });
-						session.importMessages(anthropicMessages as any);
-						session.save();
-						resume = true;
-						dbg(`built session ${sid} from ${plan.importable.length} messages`);
-					}
-					prompt = plan.promptText ?? opts.continuePrompt ?? CONTINUE_PROMPT;
+					// Missing file is normal (first round, sweep, forget): build it from the transcript.
+					resume = build();
 				}
+				prompt = plan.promptText ?? (opts.continuePrompt ?? CONTINUE_PROMPT);
 
 				const mcpServers = tools.length
 					? { [MCP_SERVER_NAME]: createToolServer(MCP_SERVER_NAME, tools.map((t: any) => ({
@@ -181,7 +227,7 @@ export function createStatelessStreams(opts: StatelessStreamOptions) {
 					killQuery();
 				});
 				q = runQuery({ prompt, options: options2 });
-				await consume(q, model, output, stream, { wasAborted: () => aborted, guard, served, round, t0, kill: killQuery });
+				await consume(q, model, output, stream, { wasAborted: () => aborted, guard, served, round, t0, kill: killQuery, dbg });
 			} catch (e: any) {
 				if (aborted) return fail("aborted", "aborted");
 				if (e instanceof BridgeError) { round.errorClass = e.errorClass; round.raw = e.raw; }
@@ -197,6 +243,7 @@ export function createStatelessStreams(opts: StatelessStreamOptions) {
 					usage: { input: output.usage.input, output: output.usage.output, cacheRead: output.usage.cacheRead, cacheWrite: output.usage.cacheWrite },
 					kill: round.kill ?? null, error: output.errorMessage ?? null, errorClass: round.errorClass ?? null, errorRaw: round.raw ?? null,
 				});
+				release?.();
 			}
 		})();
 		return stream;
@@ -205,11 +252,15 @@ export function createStatelessStreams(opts: StatelessStreamOptions) {
 	return {
 		stream: streamSimple,
 		streamSimple,
-		/** Delete the session file for a pi session id. */
-		forget(piSessionId: string): void {
+		/** Delete the session file for a pi session id, after any round running on it has finished. */
+		async forget(piSessionId: string): Promise<void> {
 			const sid = cliSessionId(piSessionId);
-			try { deleteSession(sid, opts.sessionDir, opts.claudeDir); } catch { /* none */ }
-			rmSync(fileFor(sid), { force: true });
+			const held = lock(sid);
+			try {
+				await held.acquired;
+				try { deleteSession(sid, opts.sessionDir, opts.claudeDir); } catch { /* none */ }
+				removeSessionFiles(fileFor(sid));
+			} finally { held.cancel(); }
 		},
 		/** Nothing is held between calls. */
 		dispose(): void {},
@@ -218,7 +269,7 @@ export function createStatelessStreams(opts: StatelessStreamOptions) {
 
 type Open = { piIndex: number; kind: "text" | "thinking" };
 type Pending = { id: string; name: string; input: Record<string, unknown> };
-interface ConsumeCtx { wasAborted: () => boolean; guard: Guard; served: Map<string, string>; round: RoundLog; t0: number; kill: () => void }
+interface ConsumeCtx { wasAborted: () => boolean; guard: Guard; served: Map<string, string>; round: RoundLog; t0: number; kill: () => void; dbg: (e: DebugEvent | string) => void }
 
 /**
  * Map SDK messages of ONE query to pi events. Exactly one assistant message per call.
@@ -299,7 +350,7 @@ async function consume(q: AsyncIterable<any>, model: Model<any>, output: Assista
 				stream.push({ type: "text_delta", contentIndex: o.piIndex, delta: b.text, partial: output } as any);
 				endText(o);
 			} else if (b.type === "thinking" || b.type === "redacted_thinking") {
-				const o = startText("thinking", b.thinking ?? "", b.signature ?? "");
+				const o = startText("thinking", b.thinking ?? "", b.signature ?? b.data ?? "");
 				if (b.thinking) stream.push({ type: "thinking_delta", contentIndex: o.piIndex, delta: b.thinking, partial: output } as any);
 				endText(o);
 			} else if (b.type === "tool_use") {
@@ -328,7 +379,7 @@ async function consume(q: AsyncIterable<any>, model: Model<any>, output: Assista
 			case "content_block_start": {
 				const b = ev.content_block ?? {};
 				if (b.type === "text") open.set(ev.index, startText("text", ""));
-				else if (b.type === "thinking" || b.type === "redacted_thinking") open.set(ev.index, startText("thinking", b.thinking ?? "", b.signature ?? ""));
+				else if (b.type === "thinking" || b.type === "redacted_thinking") open.set(ev.index, startText("thinking", b.thinking ?? "", b.signature ?? b.data ?? ""));
 				else if (b.type === "tool_use") {
 					const name = piName(b.name);
 					if (name) tools.set(ev.index, { id: b.id, name, input: {}, json: "" }); // nothing is announced yet
@@ -352,7 +403,7 @@ async function consume(q: AsyncIterable<any>, model: Model<any>, output: Assista
 				if (t) {
 					tools.delete(ev.index);
 					let input: Record<string, unknown> = {};
-					try { input = t.json ? JSON.parse(t.json) : {}; } catch { /* invalid JSON: closed, but unusable */ }
+					try { input = t.json ? JSON.parse(t.json) : {}; } catch { cx.dbg(`unparseable tool arguments for ${t.name}: ${t.json.slice(0, 200)}`); /* closed, but unusable */ }
 					pending.push({ id: t.id, name: t.name, input }); // announced when the message completes (#146)
 					break;
 				}

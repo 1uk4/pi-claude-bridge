@@ -19,6 +19,12 @@ export const CC_CHILD_ENV = {
 	CLAUDE_CODE_ELEGANT_MEADOW: "0",
 } as const;
 
+/** Credentials / routing that would divert Claude Code from the subscription login. */
+export const STRIPPED_ENV = [
+	"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS",
+	"CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+] as const;
+
 /**
  * Child env for the stateless provider: the parent env minus API credentials, plus
  * CC_CHILD_ENV. Claude Code prefers ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN over
@@ -26,6 +32,7 @@ export const CC_CHILD_ENV = {
  * of the subscription. Stripped even when the parent has them (VPS wolves).
  */
 export function childEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-	const { ANTHROPIC_API_KEY: _key, ANTHROPIC_AUTH_TOKEN: _token, ...rest } = base;
+	const rest = { ...base };
+	for (const k of STRIPPED_ENV) delete rest[k];
 	return { ...rest, ...CC_CHILD_ENV, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" };
 }
