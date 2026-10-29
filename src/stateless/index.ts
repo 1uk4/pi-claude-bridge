@@ -38,3 +38,7 @@ export function createStatelessProvider(opts: StatelessProviderOptions) {
 	} as any);
 	return { provider, forget: streams.forget, dispose: streams.dispose };
 }
+export { classifyError, roundError, timeoutError, BridgeError, type ErrorClass } from "./errors.js";
+export { effortFor } from "./effort.js";
+export { makeDebug, type DebugEvent } from "./debuglog.js";
+export { makeGuard, DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_ROUND_TIMEOUT_MS } from "./provider.js";

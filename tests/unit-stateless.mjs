@@ -5,7 +5,10 @@ import { mkdtempSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createSession, getSessionPath } from "cc-session-io";
-import { createStatelessStreams, cliSessionId, CONTINUE_PROMPT } from "../src/stateless/index.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { isRetryableAssistantError } from "@earendil-works/pi-ai";
+import { createStatelessStreams, cliSessionId, CONTINUE_PROMPT, classifyError, effortFor } from "../src/stateless/index.js";
 
 const MODEL = { id: "sonnet", api: "x", provider: "p", name: "s", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1e5, maxTokens: 1e4, reasoning: true };
 const TOOLS = [{ name: "add", description: "add", parameters: { type: "object", properties: { a: { type: "number" }, b: { type: "number" } } } }];
@@ -160,5 +163,173 @@ describe("stateless provider", () => {
 		const s = mk(fake([]).queryFn);
 		s.forget("gone"); s.dispose();
 		assert.equal(existsSync(p), false);
+	});
+});
+
+const assistantMsg = (id, content, extra = {}) => ({ type: "assistant", message: { id, role: "assistant", content, ...extra } });
+const tu = (id, input = { a: 1, b: 2 }, name = PREFIX + "add") => ({ type: "tool_use", id, name, input });
+const asErr = (msg) => ({ role: "assistant", stopReason: "error", errorMessage: msg });
+
+describe("stateless robustness: ported upstream fixes", () => {
+	it("non-streaming fallback: a whole assistant message under a new id after a stalled stream reaches pi, abandoned blocks dropped", async () => {
+		const stalled = [start(), ev({ type: "message_start", message: { id: "msgA", usage: {} } }), ev({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "dead", name: PREFIX + "add", input: {} } }), ev({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: '{"a"' } })];
+		const f = fake([...stalled, assistantMsg("msgB", [{ type: "text", text: "recovered" }, tu("live")], { stop_reason: "tool_use" }), MAX_TURNS]);
+		const { msg } = await run(mk(f.queryFn), [sys, user("go")]);
+		assert.equal(msg.stopReason, "toolUse");
+		assert.deepEqual(msg.content.map((b) => b.type + ":" + (b.id ?? b.text)), ["text:recovered", "toolCall:live"]);
+		assert.deepEqual(msg.content[1].arguments, { a: 1, b: 2 });
+	});
+
+	it("fallback with no stream events at all emits the whole message; same-id assistant after a stream is ignored", async () => {
+		const only = await run(mk(fake([assistantMsg("m1", [{ type: "thinking", thinking: "hm", signature: "s" }, { type: "text", text: "hi" }]), OK]).queryFn), [user("x")]);
+		assert.deepEqual(only.types, ["start", "thinking_start", "thinking_delta", "thinking_end", "text_start", "text_delta", "text_end", "done"]);
+		const dup = await run(mk(fake([start(), ...textBlock(0, "once"), delta("end_turn"), assistantMsg("msg1", [{ type: "text", text: "once" }]), OK]).queryFn), [user("x")]);
+		assert.equal(dup.msg.content.length, 1);
+	});
+
+	it("restreamed message_start drops the abandoned stream's blocks", async () => {
+		const f = fake([start(), ...textBlock(0, "partial"), ev({ type: "content_block_start", index: 1, content_block: { type: "thinking", thinking: "" } }),
+			ev({ type: "message_start", message: { id: "msg2", usage: {} } }), ...textBlock(0, "final"), delta("end_turn"), OK]);
+		const { msg } = await run(mk(f.queryFn), [user("x")]);
+		assert.deepEqual(msg.content.map((b) => b.text), ["final"]);
+	});
+
+	it("a tool call is dispatched only when its block closes (#146): a cut-off call never reaches pi", async () => {
+		const f = fake([start(), ev({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "cut", name: PREFIX + "add", input: {} } }), ev({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: '{"a":1' } }), OK]);
+		const { msg, types } = await run(mk(f.queryFn), [user("x")]);
+		assert.equal(msg.stopReason, "stop");
+		assert.equal(msg.content.length, 0);
+		assert.ok(!types.includes("toolcall_end"));
+		const g = fake([start(), ...toolBlock(0, "ok", '{"a":1}'), delta("tool_use"), MAX_TURNS]);
+		const r = await run(mk(g.queryFn), [user("x")]);
+		assert.equal(r.types.indexOf("toolcall_end") > r.types.indexOf("toolcall_start"), true);
+	});
+
+	it("tool names map in/out of the mcp__custom-tools__ namespace; unserved tools are skipped", async () => {
+		const f = fake([start(), ...toolBlock(0, "t1", '{"a":1}'), ...toolBlock(1, "t2", '{}').map((e) => JSON.parse(JSON.stringify(e).replace("custom-tools__add", "custom-tools__nope"))), delta("tool_use"), MAX_TURNS]);
+		const { msg } = await run(mk(f.queryFn), [user("x")]);
+		assert.deepEqual(msg.content.map((b) => b.name), ["add"]);
+		const up = fake([start(), ...toolBlock(0, "t3", '{}').map((e) => JSON.parse(JSON.stringify(e).replace("custom-tools__add", "CUSTOM-TOOLS__ADD"))), delta("tool_use"), MAX_TURNS]);
+		assert.deepEqual((await run(mk(up.queryFn), [user("x")])).msg.content.map((b) => b.name), ["add"]);
+	});
+
+	it("top-level anyOf/oneOf/allOf in a tool schema is flattened before it reaches Claude Code", async () => {
+		const schema = { type: "object", properties: { op: { type: "string" } }, anyOf: [{ type: "object", properties: { x: { type: "string" } } }, { type: "object", properties: { y: { type: "string" } } }] };
+		const f = fake([start(), ...textBlock(0, "k"), delta("end_turn"), OK]);
+		await run(mk(f.queryFn), [user("x")], { tools: [{ name: "u", description: "d", parameters: schema }] });
+		const server = f.calls[0].options.mcpServers["custom-tools"];
+		const [ct, st] = InMemoryTransport.createLinkedPair();
+		const inst = server.instance ?? server;
+		await inst.connect(st);
+		const client = new Client({ name: "t", version: "1" });
+		await client.connect(ct);
+		const tool = (await client.listTools()).tools[0];
+		for (const k of ["anyOf", "oneOf", "allOf"]) assert.ok(!(k in tool.inputSchema));
+		assert.deepEqual(Object.keys(tool.inputSchema.properties).sort(), ["op", "x", "y"]);
+		await client.close();
+	});
+
+	it("<synthetic> failure notice becomes an error (not output); partial blocks dropped", async () => {
+		const f = fake([start(), ...textBlock(0, "x"), assistantMsg("syn", [{ type: "text", text: "API Error: 529 overloaded" }], { model: "<synthetic>" }), { ...OK, is_error: false }]);
+		const { events, msg } = await run(mk(f.queryFn), [user("x")]);
+		assert.equal(events.at(-1).type, "error");
+		assert.match(msg.errorMessage, /overloaded/);
+		assert.equal(isRetryableAssistantError(msg), true);
+		assert.ok(!msg.content.some((b) => /529/.test(b.text ?? "")));
+	});
+});
+
+describe("stateless robustness: timeouts", () => {
+	function hanging(first = []) {
+		let closed = 0, release;
+		const queryFn = () => {
+			const msgs = [...first];
+			return { close: () => { closed++; release?.(); }, [Symbol.asyncIterator]() { return this; },
+				next: () => msgs.length ? Promise.resolve({ done: false, value: msgs.shift() }) : new Promise((r) => { release = () => r({ done: true, value: undefined }); }) };
+		};
+		return { queryFn, closed: () => closed };
+	}
+	it("idle: no SDK message -> kills the query, retryable 'connection lost' error", async () => {
+		const h = hanging([start()]);
+		const s = createStatelessStreams({ sessionDir, claudeDir, queryFn: h.queryFn, idleTimeoutMs: 40, roundTimeoutMs: 5000 });
+		const { events, msg } = await run(s, [user("x")]);
+		assert.equal(events.at(-1).type, "error");
+		assert.match(msg.errorMessage, /connection lost: no message from Claude Code for 40 ms \(idle timeout\), query killed/);
+		assert.equal(isRetryableAssistantError(msg), true);
+		assert.equal(h.closed(), 1);
+	});
+	it("total: messages keep coming but the round exceeds roundTimeoutMs", async () => {
+		let closed = 0;
+		const queryFn = () => ({ close: () => { closed++; }, [Symbol.asyncIterator]() { return this; }, next: () => new Promise((r) => setTimeout(() => r({ done: false, value: ev({ type: "ping" }) }), 10)) });
+		const s = createStatelessStreams({ sessionDir, claudeDir, queryFn, idleTimeoutMs: 1000, roundTimeoutMs: 80 });
+		const { msg } = await run(s, [user("x")]);
+		assert.match(msg.errorMessage, /connection lost: round did not finish within 80 ms \(round timeout\), query killed/);
+		assert.equal(isRetryableAssistantError(msg), true);
+		assert.equal(closed, 1);
+	});
+	it("a finished round leaves no live timers (process can exit; late timeouts do nothing)", async () => {
+		const f = fake([start(), ...textBlock(0, "k"), delta("end_turn"), OK]);
+		const s = createStatelessStreams({ sessionDir, claudeDir, queryFn: f.queryFn, idleTimeoutMs: 30, roundTimeoutMs: 30 });
+		const { msg } = await run(s, [user("x")]);
+		await new Promise((r) => setTimeout(r, 80));
+		assert.equal(msg.stopReason, "stop");
+	});
+});
+
+describe("stateless robustness: error classes, reasoning, logging", () => {
+	const errResult = (text, extra = {}) => ({ type: "result", subtype: "error_during_execution", is_error: true, errors: [text], ...extra });
+	it("rate limit / quota / overloaded -> retryable; auth / invalid request -> fatal", async () => {
+		for (const [text, extra] of [["You've hit your usage limit", { api_error_status: 429 }], ["API Error: overloaded_error", {}], ["rate limit reached", {}], ["Claude AI usage limit reached (quota exceeded, billing)", {}], ["Server error", { api_error_status: 503 }]]) {
+			const { msg } = await run(mk(fake([start(), errResult(text, extra)]).queryFn), [user("x")]);
+			assert.equal(isRetryableAssistantError(msg), true, `${text} -> ${msg.errorMessage}`);
+		}
+		for (const [text, extra] of [["Invalid API key. Please run /login", { api_error_status: 401 }], ["invalid_request_error: messages.0: bad", { api_error_status: 400 }], ["authentication_failed 429", {}]]) {
+			const { msg } = await run(mk(fake([start(), errResult(text, extra)]).queryFn), [user("x")]);
+			assert.equal(isRetryableAssistantError(msg), false, `${text} -> ${msg.errorMessage}`);
+			assert.match(msg.errorMessage, /fatal/);
+		}
+		assert.equal(classifyError("boom"), "unknown");
+		assert.equal(classifyError("x", { code: "rate_limit" }), "retryable");
+		assert.equal(classifyError("x", { code: "authentication_failed" }), "fatal");
+	});
+	it("pi reasoning maps to the SDK effort option (+ summarized thinking display)", async () => {
+		const f = fake([start(), ...textBlock(0, "k"), delta("end_turn"), OK]);
+		await run(mk(f.queryFn), [user("x")], { reasoning: "high" });
+		assert.equal(f.calls[0].options.effort, "high");
+		assert.equal(f.calls[0].options.extraArgs["thinking-display"], "summarized");
+		const g = fake([start(), ...textBlock(0, "k"), delta("end_turn"), OK]);
+		await run(mk(g.queryFn), [user("x")]);
+		assert.equal(g.calls[0].options.effort, undefined);
+		assert.equal(effortFor({ thinkingLevelMap: { xhigh: "xhigh" } }, "xhigh"), "xhigh");
+		assert.equal(effortFor({}, "xhigh"), "max");
+		assert.equal(effortFor({ thinkingLevelMap: { low: null } }, "low"), undefined);
+	});
+	it("debug log: JSON lines with session id, prompt kind, timings, usage, stop reason, stderr, kills", async () => {
+		const log = join(root, "dbg", "bridge.jsonl");
+		const queryFn = (args) => { args.options.stderr("cli says hi\n"); return fake([start(), ...textBlock(0, "k"), delta("end_turn"), OK]).queryFn(args); };
+		await run(createStatelessStreams({ sessionDir, claudeDir, queryFn, debug: true, debugLogPath: log }), [user("x")], { sessionId: "logme" });
+		const lines = readFileSync(log, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+		const byEvent = (e) => lines.find((l) => l.event === e);
+		assert.equal(byEvent("round_start").sessionId, cliSessionId("logme"));
+		assert.equal(byEvent("round_start").promptKind, "user");
+		assert.equal(byEvent("cli_stderr").line, "cli says hi");
+		const end = byEvent("round_end");
+		assert.deepEqual([end.sessionId, end.promptKind, end.ok, end.stopReason, end.sdkStopReason], [cliSessionId("logme"), "user", true, "stop", "end_turn"]);
+		assert.equal(typeof end.firstEventMs, "number"); assert.equal(typeof end.endMs, "number");
+		assert.deepEqual(end.usage, { input: 2, output: 9, cacheRead: 100, cacheWrite: 7 });
+		assert.ok(byEvent("round_start").ts);
+		// kills are logged with the reason
+		const log2 = join(root, "dbg", "kill.jsonl");
+		const hang = () => ({ close() {}, [Symbol.asyncIterator]() { return this; }, next: () => new Promise(() => {}) });
+		await run(createStatelessStreams({ sessionDir, claudeDir, queryFn: hang, debug: true, debugLogPath: log2, idleTimeoutMs: 20 }), [user("x")]);
+		const l2 = readFileSync(log2, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+		assert.equal(l2.find((l) => l.event === "kill").reason, "idle timeout");
+		assert.equal(l2.find((l) => l.event === "round_end").kill, "idle");
+		assert.equal(l2.find((l) => l.event === "round_end").ok, false);
+	});
+	it("without debug or env, nothing is written", async () => {
+		const log = join(root, "dbg", "off.jsonl");
+		await run(createStatelessStreams({ sessionDir, claudeDir, queryFn: fake([start(), OK]).queryFn, debugLogPath: log }), [user("x")]);
+		assert.equal(existsSync(log), false);
 	});
 });
