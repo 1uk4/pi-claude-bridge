@@ -111,7 +111,7 @@ export function createStatelessStreams(opts: StatelessStreamOptions) {
 				if (options?.signal?.aborted) return fail("aborted", "aborted");
 				const plan = planRound(context.messages);
 				// pi-ai 1.4 delivers tools on system messages; options/context.tools is the 1.2 fallback.
-				const tools = plan.tools.length ? plan.tools : (options?.tools ?? context.tools ?? []);
+				const tools = plan.toolsDeclared ? plan.tools : (options?.tools ?? context.tools ?? []);
 				const piSessionId = options?.sessionId;
 				if (!piSessionId) return fail("error", "stateless provider: options.sessionId is required (one session file per pi session)");
 				const sid = cliSessionId(piSessionId);

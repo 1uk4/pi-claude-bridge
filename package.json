@@ -64,10 +64,6 @@
     ]
   },
   "exports": {
-    ".": {
-      "types": "./dist/stateless/index.d.ts",
-      "default": "./dist/stateless/index.js"
-    },
     "./stateless": {
       "types": "./dist/stateless/index.d.ts",
       "default": "./dist/stateless/index.js"
