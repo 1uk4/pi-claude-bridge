@@ -174,6 +174,22 @@ describe("stateless provider", () => {
 		assert.deepEqual(tools.tools.map((t) => [t.name, t.description]), [["add", "add v2"]]);
 	});
 
+	it("a redefined tool (removal + addition of the same name in one message) survives", async () => {
+		const v2 = { ...TOOLS[0], description: "add v2" };
+		const f = fake([start(), ...textBlock(0, "x"), delta("end_turn"), OK]);
+		const msgs = [{ role: "system", content: "base", toolsAdded: [TOOLS[0]], timestamp: 1 }, user("hi"), { role: "system", content: "", toolsRemoved: [{ name: "add" }], toolsAdded: [v2], timestamp: 2 }];
+		for await (const _ of mk(f.queryFn).streamSimple(MODEL, { messages: msgs }, { sessionId: "redef" }));
+		const tools = await f.calls[0].options.mcpServers["custom-tools"].instance.server._requestHandlers.get("tools/list")({ method: "tools/list" });
+		assert.deepEqual(tools.tools.map((t) => [t.name, t.description]), [["add", "add v2"]]);
+	});
+
+	it("removing every tool leaves zero tools; the options.tools fallback is ignored once tools were declared", async () => {
+		const f = fake([start(), ...textBlock(0, "x"), delta("end_turn"), OK]);
+		const msgs = [{ role: "system", content: "base", toolsAdded: [TOOLS[0]], timestamp: 1 }, user("hi"), { role: "system", content: "", toolsRemoved: [{ name: "add" }], timestamp: 2 }];
+		for await (const _ of mk(f.queryFn).streamSimple(MODEL, { messages: msgs, tools: TOOLS }, { sessionId: "rmall", tools: TOOLS }));
+		assert.equal(f.calls[0].options.mcpServers?.["custom-tools"], undefined);
+	});
+
 	it("replaySystem: sections replace, null deletes, render after content; later content appends", () => {
 		const r = replaySystem([
 			{ role: "system", content: "base", sections: { a: "A1", b: "B1" } },
