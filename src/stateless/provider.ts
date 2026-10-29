@@ -84,35 +84,44 @@ export function createStatelessStreams(opts: StatelessStreamOptions) {
 		void (async () => {
 			try {
 				if (options?.signal?.aborted) return fail("aborted", "aborted");
-				const tools = options?.tools ?? context.tools ?? [];
 				const plan = planRound(context.messages);
-				const piSessionId = options?.sessionId ?? "default";
+				// pi-ai 1.4 delivers tools on system messages; options/context.tools is the 1.2 fallback.
+				const tools = plan.tools.length ? plan.tools : (options?.tools ?? context.tools ?? []);
+				const piSessionId = options?.sessionId;
+				if (!piSessionId) return fail("error", "stateless provider: options.sessionId is required (one session file per pi session)");
 				const sid = cliSessionId(piSessionId);
 				const path = fileFor(sid);
 				const toolNames = new Map(tools.map((t: any) => [t.name, `${MCP_TOOL_PREFIX}${t.name}`]));
 
 				let prompt: string;
 				let resume = false;
-				if (existsSync(path)) {
+				const continueText = opts.continuePrompt ?? CONTINUE_PROMPT;
+				let haveFile = existsSync(path);
+				if (haveFile) {
 					// TODO(session-store ticket): verify the file against the transcript here
 					// (history length/ids match, denial records present) and rebuild on mismatch.
-					resume = true;
+					// Note: convertPiMessages returns sanitizedIds; the verify seam must compare
+					// against the sanitized tool_use ids, not pi's raw ones.
 					if (plan.results.size) {
 						const patched = patchToolResults(path, plan.results);
 						dbg(`patched ${patched.length}/${plan.results.size} tool results`);
+						if (patched.length < plan.results.size) { rmSync(path, { force: true }); haveFile = false; }
 					}
-					prompt = plan.promptText ?? (plan.results.size ? (opts.continuePrompt ?? CONTINUE_PROMPT) : (opts.continuePrompt ?? CONTINUE_PROMPT));
+				}
+				if (haveFile) {
+					resume = true;
+					prompt = plan.promptText ?? continueText;
 				} else {
 					// Missing file: build it from the transcript (real tool_use/tool_result records).
 					if (plan.importable.length) {
-						const { anthropicMessages } = convertPiMessages(plan.importable, toolNames);
+						const { anthropicMessages } = convertPiMessages(plan.importable, toolNames); // TODO: sanitizedIds
 						const session = createSession({ projectPath: opts.sessionDir, sessionId: sid, claudeDir: opts.claudeDir, model: opts.cliModelId?.(model) ?? model.id });
 						session.importMessages(anthropicMessages as any);
 						session.save();
 						resume = true;
 						dbg(`built session ${sid} from ${plan.importable.length} messages`);
 					}
-					prompt = plan.promptText ?? opts.continuePrompt ?? CONTINUE_PROMPT;
+					prompt = plan.promptText ?? continueText;
 				}
 
 				const mcpServers = tools.length
@@ -142,7 +151,7 @@ export function createStatelessStreams(opts: StatelessStreamOptions) {
 					...(opts.pathToClaudeCodeExecutable ? { pathToClaudeCodeExecutable: opts.pathToClaudeCodeExecutable } : {}),
 				};
 				q = runQuery({ prompt, options: options2 });
-				await consume(q, model, output, stream, () => aborted);
+				await consume(q, model, output, stream, () => aborted, dbg);
 			} catch (e: any) {
 				if (aborted) return fail("aborted", "aborted");
 				fail("error", String(e?.message ?? e));
@@ -170,7 +179,7 @@ export function createStatelessStreams(opts: StatelessStreamOptions) {
 type Open = { piIndex: number; kind: "text" | "thinking" | "tool"; json: string };
 
 /** Map SDK messages of ONE query to pi events. Exactly one assistant message per call. */
-async function consume(q: AsyncIterable<any>, model: Model<any>, output: AssistantMessage, stream: AssistantMessageEventStream, wasAborted: () => boolean) {
+async function consume(q: AsyncIterable<any>, model: Model<any>, output: AssistantMessage, stream: AssistantMessageEventStream, wasAborted: () => boolean, dbg: (m: string) => void = () => {}) {
 	const open = new Map<number, Open>();
 	const fallback: any[] = [];
 	let started = false, sawToolUse = false, result: any = null, sdkStop: string | undefined;
@@ -185,7 +194,7 @@ async function consume(q: AsyncIterable<any>, model: Model<any>, output: Assista
 		if (o.kind === "text") stream.push({ type: "text_end", contentIndex: o.piIndex, content: block.text, partial: output } as any);
 		else if (o.kind === "thinking") stream.push({ type: "thinking_end", contentIndex: o.piIndex, content: block.thinking, partial: output } as any);
 		else {
-			try { block.arguments = o.json ? JSON.parse(o.json) : {}; } catch { block.arguments = {}; }
+			try { block.arguments = o.json ? JSON.parse(o.json) : {}; } catch { dbg(`unparseable tool arguments for ${block.name}: ${o.json.slice(0, 200)}`); block.arguments = {}; }
 			stream.push({ type: "toolcall_end", contentIndex: o.piIndex, toolCall: block, partial: output } as any);
 		}
 	};
@@ -197,7 +206,7 @@ async function consume(q: AsyncIterable<any>, model: Model<any>, output: Assista
 			open.set(idx, { piIndex, kind: "text", json: "" });
 			stream.push({ type: "text_start", contentIndex: piIndex, partial: output } as any);
 		} else if (b.type === "thinking" || b.type === "redacted_thinking") {
-			output.content.push({ type: "thinking", thinking: b.thinking ?? "", thinkingSignature: b.signature ?? "" } as any);
+			output.content.push({ type: "thinking", thinking: b.thinking ?? "", thinkingSignature: b.signature ?? b.data ?? "" } as any);
 			open.set(idx, { piIndex, kind: "thinking", json: "" });
 			stream.push({ type: "thinking_start", contentIndex: piIndex, partial: output } as any);
 		} else if (b.type === "tool_use") {
@@ -258,7 +267,7 @@ async function consume(q: AsyncIterable<any>, model: Model<any>, output: Assista
 			if (!o) return;
 			const block: any = output.content[o.piIndex];
 			if (b.type === "text") { block.text = b.text; stream.push({ type: "text_delta", contentIndex: o.piIndex, delta: b.text, partial: output } as any); }
-			else if (b.type === "thinking") { block.thinking = b.thinking; }
+			else if (b.type === "thinking" || b.type === "redacted_thinking") { block.thinking = b.thinking ?? ""; block.thinkingSignature = b.signature ?? b.data ?? ""; }
 			else if (b.type === "tool_use") o.json = JSON.stringify(b.input ?? {});
 			closeBlock(i);
 		});
@@ -272,7 +281,7 @@ async function consume(q: AsyncIterable<any>, model: Model<any>, output: Assista
 		const msg = (Array.isArray(result.errors) && result.errors.join("; ")) || result.result || result.subtype;
 		throw new Error(String(msg));
 	}
-	output.stopReason = sawToolUse ? "toolUse" : sdkStop === "max_tokens" ? "length" : "stop";
+	output.stopReason = sdkStop === "max_tokens" ? "length" : sawToolUse ? "toolUse" : "stop";
 	stream.push({ type: "done", reason: output.stopReason, message: output } as any);
 	stream.end();
 }
