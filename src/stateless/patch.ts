@@ -5,17 +5,17 @@
 // those denials with the real results pi produced, matched by tool_use_id. uuid /
 // parentUuid are never touched, so the record chain stays valid.
 //
-// TODO(session-store ticket): this is a plain read-modify-write. Atomic write
-// (temp file + rename), a per-session lock, and a "tail is not the expected shape ->
-// rebuild" fallback belong here.
+// The write is atomic: the new content goes to a temp file beside the original
+// (`<file>.tmp`, any stale one is removed first) and is renamed over it, so a crash
+// leaves the original intact. Callers hold the per-session lock (see store.ts).
 
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 
 export type ResultContent = string | Array<Record<string, unknown>>;
 export interface ToolResultPatch { content: ResultContent; isError?: boolean }
 
 /** Replace tool_result blocks whose tool_use_id is in `results`. Returns the ids patched. */
-export function patchToolResults(path: string, results: Map<string, ToolResultPatch>): string[] {
+export function patchToolResults(path: string, results: Map<string, ToolResultPatch>, opts: { requireAll?: boolean; beforeRename?: () => void } = {}): string[] {
 	const raw = readFileSync(path, "utf8");
 	const trailingNewline = raw.endsWith("\n");
 	const lines = raw.split("\n").filter(Boolean);
@@ -36,6 +36,13 @@ export function patchToolResults(path: string, results: Map<string, ToolResultPa
 		}
 		return changed ? JSON.stringify(rec) : line;
 	});
-	if (patched.size) writeFileSync(path, out.join("\n") + (trailingNewline ? "\n" : ""));
+	if (opts.requireAll && patched.size < results.size) return [...patched]; // nothing written: caller rebuilds
+	if (patched.size) {
+		const tmp = `${path}.tmp`;
+		rmSync(tmp, { force: true });
+		writeFileSync(tmp, out.join("\n") + (trailingNewline ? "\n" : ""));
+		opts.beforeRename?.();
+		renameSync(tmp, path);
+	}
 	return [...patched];
 }

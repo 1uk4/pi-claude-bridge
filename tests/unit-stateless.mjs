@@ -1,11 +1,11 @@
 // Stateless provider: one query per round, driven by a fake queryFn (no subscription use).
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, existsSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, existsSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createSession, getSessionPath } from "cc-session-io";
-import { createStatelessStreams, cliSessionId, CONTINUE_PROMPT } from "../src/stateless/index.js";
+import { createStatelessStreams, cliSessionId, CONTINUE_PROMPT, patchToolResults } from "../src/stateless/index.js";
 
 const MODEL = { id: "sonnet", api: "x", provider: "p", name: "s", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1e5, maxTokens: 1e4, reasoning: true };
 const TOOLS = [{ name: "add", description: "add", parameters: { type: "object", properties: { a: { type: "number" }, b: { type: "number" } } } }];
@@ -160,5 +160,141 @@ describe("stateless provider", () => {
 		const s = mk(fake([]).queryFn);
 		s.forget("gone"); s.dispose();
 		assert.equal(existsSync(p), false);
+	});
+});
+
+describe("session store", () => {
+	const okFake = () => fake([start(), ...textBlock(0, "ok"), delta("end_turn"), OK]);
+	const withDebug = (queryFn, extra = {}) => { const log = []; return { streams: createStatelessStreams({ sessionDir, claudeDir, queryFn, debug: (m) => log.push(m), ...extra }), log }; };
+	const toolResults = (p) => records(p).filter((r) => r.type === "user" && Array.isArray(r.message?.content)).flatMap((r) => r.message.content).filter((b) => b.type === "tool_result");
+
+	it("recovery while a tool_result is pending: file deleted -> rebuilt from the transcript, round works", async () => {
+		const p = seedDenied("lost", ["t1"]);
+		rmSync(p);
+		const f = okFake();
+		const { streams, log } = withDebug(f.queryFn);
+		const { msg } = await run(streams, [sys, user("add things"), asst("t1"), res("t1", "RESULT=5")], { sessionId: "lost" });
+		assert.equal(msg.stopReason, "stop");
+		assert.ok(existsSync(p));
+		assert.deepEqual(toolResults(p).map((b) => b.tool_use_id), ["t1"]);
+		assert.ok(JSON.stringify(toolResults(p)[0].content).includes("RESULT=5"));
+		assert.equal(f.calls[0].options.resume, cliSessionId("lost"));
+		assert.ok(log.some((l) => l.startsWith("built session")));
+	});
+
+	it("steer while results are pending: matching file is verified and patched, no rebuild", async () => {
+		const p = seedDenied("steer2", ["a", "b"]);
+		const f = okFake();
+		const { streams, log } = withDebug(f.queryFn);
+		await run(streams, [sys, user("add things"), asst("a", "b"), res("a", "R1"), res("b", "R2"), user("also do X")], { sessionId: "steer2" });
+		assert.equal(f.calls[0].prompt, "also do X");
+		assert.ok(!log.some((l) => l.includes("rebuilding")), log.join("|"));
+		assert.deepEqual(toolResults(p).map((b) => b.content), ["R1", "R2"]);
+	});
+
+	it("mismatch (different tool_use ids / message count) -> rebuild, reason reported", async () => {
+		const p = seedDenied("mism", ["old"]);
+		const f = okFake();
+		const { streams, log } = withDebug(f.queryFn);
+		await run(streams, [sys, user("add things"), asst("new"), res("new", "RESULT=9")], { sessionId: "mism" });
+		assert.ok(log.some((l) => l.includes("rebuilding session") && l.includes("tool_use ids differ")), log.join("|"));
+		assert.deepEqual(toolResults(p).map((b) => b.tool_use_id), ["new"]);
+		// extra history in the transcript -> count mismatch
+		const f2 = okFake();
+		const d2 = withDebug(f2.queryFn);
+		await run(d2.streams, [sys, user("add things"), asst("new"), res("new", "R"), user("more")], { sessionId: "mism" });
+		await run(d2.streams, [sys, user("add things"), asst("new"), res("new", "R"), user("more"), asst("n2"), res("n2", "R2")], { sessionId: "mism" });
+		assert.ok(d2.log.some((l) => l.includes("message count")), d2.log.join("|"));
+	});
+
+	it("denial record missing in the file -> falls back to a rebuild instead of failing", async () => {
+		const p = seedDenied("nodenial", ["t1"]);
+		writeFileSync(p, records(p).filter((r) => !(r.type === "user" && JSON.stringify(r).includes("denied by hook"))).map((r) => JSON.stringify(r)).join("\n") + "\n");
+		const f = okFake();
+		const { streams, log } = withDebug(f.queryFn);
+		const { msg } = await run(streams, [sys, user("add things"), asst("t1"), res("t1", "RESULT=1")], { sessionId: "nodenial" });
+		assert.equal(msg.stopReason, "stop");
+		assert.ok(log.some((l) => l.includes("rebuilding")));
+		assert.ok(JSON.stringify(toolResults(p)).includes("RESULT=1"));
+	});
+
+	it("a large (~200 KB) result is patched intact", async () => {
+		const p = seedDenied("big", ["t1"]);
+		const big = "x".repeat(200_000) + "END";
+		const f = okFake();
+		const { streams, log } = withDebug(f.queryFn);
+		await run(streams, [sys, user("add things"), asst("t1"), res("t1", big)], { sessionId: "big" });
+		assert.ok(!log.some((l) => l.includes("rebuilding")));
+		assert.equal(toolResults(p)[0].content, big);
+	});
+
+	it("crash during the patch write: temp left behind, original intact; the next round recovers", async () => {
+		const p = seedDenied("crash", ["t1"]);
+		const orig = readFileSync(p, "utf8");
+		assert.throws(() => patchToolResults(p, new Map([["t1", { content: "R" }]]), { beforeRename: () => { throw new Error("power cut"); } }), /power cut/);
+		assert.equal(readFileSync(p, "utf8"), orig);
+		assert.ok(existsSync(p + ".tmp"));
+		const f = okFake();
+		const { streams, log } = withDebug(f.queryFn);
+		await run(streams, [sys, user("add things"), asst("t1"), res("t1", "RESULT=2")], { sessionId: "crash" });
+		assert.ok(!log.some((l) => l.includes("rebuilding")));
+		assert.equal(toolResults(p)[0].content, "RESULT=2");
+		assert.equal(existsSync(p + ".tmp"), false);
+		// a crash inside a round falls back to a rebuild
+		const p2 = seedDenied("crash2", ["t1"]);
+		const d2 = withDebug(okFake().queryFn, { patchHook: () => { throw new Error("disk full"); } });
+		const r = await run(d2.streams, [sys, user("add things"), asst("t1"), res("t1", "RESULT=3")], { sessionId: "crash2" });
+		assert.equal(r.msg.stopReason, "stop");
+		assert.ok(d2.log.some((l) => l.includes("patch failed: disk full")));
+		assert.ok(JSON.stringify(toolResults(p2)).includes("RESULT=3"));
+	});
+
+	it("concurrent rounds on one session serialize; different sessions do not", async () => {
+		const seen = [];
+		let active = 0, maxActive = 0;
+		const queryFn = (args) => (async function* () {
+			active++; maxActive = Math.max(maxActive, active); seen.push("start");
+			await new Promise((r) => setTimeout(r, 40));
+			for (const m of [start(), ...textBlock(0, "ok"), delta("end_turn"), OK]) yield m;
+			seen.push("end"); active--;
+		})();
+		const streams = mk(queryFn);
+		await Promise.all([1, 2, 3].map(() => run(streams, [sys, user("hi")], { sessionId: "same" })));
+		assert.equal(maxActive, 1); assert.deepEqual(seen, ["start", "end", "start", "end", "start", "end"]);
+		maxActive = 0;
+		await Promise.all([run(streams, [sys, user("hi")], { sessionId: "o1" }), run(streams, [sys, user("hi")], { sessionId: "o2" })]);
+		assert.equal(maxActive, 2);
+	});
+
+	it("forget removes file and temp leftovers; idle sweep removes only stale sessions, at most hourly", async () => {
+		const pf = seedDenied("fg", ["t"]);
+		writeFileSync(pf + ".tmp", "x");
+		const s = mk(fake([]).queryFn);
+		s.forget("fg");
+		assert.equal(existsSync(pf), false); assert.equal(existsSync(pf + ".tmp"), false);
+
+		const old = seedDenied("old1", ["t"]), fresh = seedDenied("fresh1", ["t"]);
+		writeFileSync(old + ".tmp", "x");
+		const past = new Date(Date.now() - 8 * 86_400_000);
+		utimesSync(old, past, past); utimesSync(old + ".tmp", past, past);
+		let t = Date.now();
+		const { streams, log } = withDebug(fake([]).queryFn, { now: () => t });
+		assert.equal(existsSync(old), false); assert.equal(existsSync(old + ".tmp"), false);
+		assert.equal(existsSync(fresh), true);
+		assert.ok(log.some((l) => l.includes("idle sweep removed")));
+		// not again within the hour
+		const old2 = seedDenied("old2", ["t"]);
+		utimesSync(old2, past, past);
+		t += 30 * 60_000;
+		await run(streams, [sys, user("hi")], { sessionId: "sw" });
+		assert.equal(existsSync(old2), true);
+		t += 31 * 60_000;
+		await run(streams, [sys, user("hi")], { sessionId: "sw" });
+		assert.equal(existsSync(old2), false);
+		// ttl 0 disables
+		const old3 = seedDenied("old3", ["t"]);
+		utimesSync(old3, past, past);
+		withDebug(fake([]).queryFn, { sessionTtlDays: 0 });
+		assert.equal(existsSync(old3), true);
 	});
 });

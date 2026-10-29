@@ -12,10 +12,11 @@
 // Every tool call is denied by a PreToolUse hook: pi runs the tools, never Claude Code.
 
 import { createHash } from "node:crypto";
-import { existsSync, rmSync } from "node:fs";
+import { existsSync } from "node:fs";
+import { dirname } from "node:path";
 import { query as sdkQuery, type Options } from "@anthropic-ai/claude-agent-sdk";
 import { createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEventStream, type Message, type Model, type SimpleStreamOptions } from "@earendil-works/pi-ai";
-import { createSession, deleteSession, getSessionPath } from "cc-session-io";
+import { createSession, deleteSession, getSessionPath, repairToolPairing } from "cc-session-io";
 import { convertPiMessages } from "../convert.js";
 import { createToolServer } from "../mcp-server.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX } from "../skills.js";
@@ -23,6 +24,7 @@ import { updateUsage } from "../usage.js";
 import { childEnv } from "./env.js";
 import { patchToolResults } from "./patch.js";
 import { CONTINUE_PROMPT, planRound } from "./plan.js";
+import { createLocks, logicalFromMessages, removeSessionFiles, sweepIdle, verifyAgainst } from "./store.js";
 
 export type QueryFn = (args: { prompt: string; options: Options }) => AsyncIterable<any> & { close?: () => void };
 
@@ -40,6 +42,12 @@ export interface StatelessStreamOptions {
 	pathToClaudeCodeExecutable?: string;
 	continuePrompt?: string;
 	debug?: (msg: string) => void;
+	/** Session files untouched for this many days are deleted (checked at creation, then at most hourly). Default 7; 0 disables. */
+	sessionTtlDays?: number;
+	/** Clock, injectable for tests. */
+	now?: () => number;
+	/** Test seam: runs after the patch temp file is written, before the rename. */
+	patchHook?: () => void;
 }
 
 const DENY_REASON = "The caller runs tools itself; this call is recorded and executed outside this session.";
@@ -64,6 +72,20 @@ export function createStatelessStreams(opts: StatelessStreamOptions) {
 	const runQuery: QueryFn = opts.queryFn ?? ((a) => sdkQuery(a as any) as any);
 	const dbg = opts.debug ?? (() => {});
 	const fileFor = (sid: string) => getSessionPath(sid, opts.sessionDir, opts.claudeDir);
+	const lock = createLocks();
+	const now = opts.now ?? Date.now;
+	const ttlMs = (opts.sessionTtlDays ?? 7) * 86_400_000;
+	let lastSweep = -Infinity;
+	const sweep = () => {
+		const t = now();
+		if (t - lastSweep < 3_600_000) return;
+		lastSweep = t;
+		try {
+			const n = sweepIdle(dirname(fileFor("00000000-0000-4000-8000-000000000000")), ttlMs, t);
+			if (n) dbg(`idle sweep removed ${n} session file(s)`);
+		} catch (e: any) { dbg(`idle sweep failed: ${e?.message ?? e}`); }
+	};
+	sweep();
 
 	function streamSimple(model: Model<any>, context: { messages: Message[]; tools?: any[] }, options?: SimpleStreamOptions & { tools?: any[]; sessionId?: string }): AssistantMessageEventStream {
 		const stream = createAssistantMessageEventStream();
@@ -71,6 +93,7 @@ export function createStatelessStreams(opts: StatelessStreamOptions) {
 		const abort = new AbortController();
 		let q: (AsyncIterable<any> & { close?: () => void }) | undefined;
 		let aborted = false;
+		let release: (() => void) | undefined;
 		const onAbort = () => { aborted = true; abort.abort(); try { q?.close?.(); } catch { /* already gone */ } };
 		options?.signal?.addEventListener("abort", onAbort, { once: true });
 
@@ -91,29 +114,44 @@ export function createStatelessStreams(opts: StatelessStreamOptions) {
 				const path = fileFor(sid);
 				const toolNames = new Map(tools.map((t: any) => [t.name, `${MCP_TOOL_PREFIX}${t.name}`]));
 
+				// One round at a time per session: verify, patch and the query itself.
+				release = await lock(sid);
+				if (aborted) return fail("aborted", "aborted");
+				sweep();
+
+				const { anthropicMessages, sanitizedIds } = plan.importable.length
+					? convertPiMessages(plan.importable, toolNames)
+					: { anthropicMessages: [] as any[], sanitizedIds: new Map<string, string>() };
+				const build = () => {
+					removeSessionFiles(path);
+					if (!plan.importable.length) return false;
+					const session = createSession({ projectPath: opts.sessionDir, sessionId: sid, claudeDir: opts.claudeDir, model: opts.cliModelId?.(model) ?? model.id });
+					session.importMessages(repairToolPairing(anthropicMessages as any) as any);
+					session.save();
+					dbg(`built session ${sid} from ${plan.importable.length} messages`);
+					return true;
+				};
+				const rebuild = (reason: string) => { dbg(`rebuilding session ${sid}: ${reason}`); return build(); };
+
 				let prompt: string;
 				let resume = false;
 				if (existsSync(path)) {
-					// TODO(session-store ticket): verify the file against the transcript here
-					// (history length/ids match, denial records present) and rebuild on mismatch.
-					resume = true;
-					if (plan.results.size) {
-						const patched = patchToolResults(path, plan.results);
-						dbg(`patched ${patched.length}/${plan.results.size} tool results`);
+					const mapId = (id: string) => sanitizedIds.get(id) ?? id;
+					const resultIds = [...plan.results.keys()].map(mapId);
+					let reason = verifyAgainst(path, logicalFromMessages(anthropicMessages as any, mapId), resultIds);
+					if (!reason && plan.results.size) {
+						try {
+							const patched = patchToolResults(path, new Map([...plan.results].map(([k, v]) => [mapId(k), v])), { requireAll: true, beforeRename: opts.patchHook });
+							if (patched.length < plan.results.size) reason = `denial record not found (${patched.length}/${plan.results.size})`;
+							else dbg(`patched ${patched.length}/${plan.results.size} tool results`);
+						} catch (e: any) { reason = `patch failed: ${e?.message ?? e}`; }
 					}
-					prompt = plan.promptText ?? (plan.results.size ? (opts.continuePrompt ?? CONTINUE_PROMPT) : (opts.continuePrompt ?? CONTINUE_PROMPT));
+					resume = reason ? rebuild(reason) : true;
 				} else {
-					// Missing file: build it from the transcript (real tool_use/tool_result records).
-					if (plan.importable.length) {
-						const { anthropicMessages } = convertPiMessages(plan.importable, toolNames);
-						const session = createSession({ projectPath: opts.sessionDir, sessionId: sid, claudeDir: opts.claudeDir, model: opts.cliModelId?.(model) ?? model.id });
-						session.importMessages(anthropicMessages as any);
-						session.save();
-						resume = true;
-						dbg(`built session ${sid} from ${plan.importable.length} messages`);
-					}
-					prompt = plan.promptText ?? opts.continuePrompt ?? CONTINUE_PROMPT;
+					// Missing file is normal (first round, sweep, forget): build it from the transcript.
+					resume = build();
 				}
+				prompt = plan.promptText ?? opts.continuePrompt ?? CONTINUE_PROMPT;
 
 				const mcpServers = tools.length
 					? { [MCP_SERVER_NAME]: createToolServer(MCP_SERVER_NAME, tools.map((t: any) => ({
@@ -148,6 +186,7 @@ export function createStatelessStreams(opts: StatelessStreamOptions) {
 				fail("error", String(e?.message ?? e));
 			} finally {
 				options?.signal?.removeEventListener("abort", onAbort);
+				release?.();
 			}
 		})();
 		return stream;
@@ -160,7 +199,7 @@ export function createStatelessStreams(opts: StatelessStreamOptions) {
 		forget(piSessionId: string): void {
 			const sid = cliSessionId(piSessionId);
 			try { deleteSession(sid, opts.sessionDir, opts.claudeDir); } catch { /* none */ }
-			rmSync(fileFor(sid), { force: true });
+			removeSessionFiles(fileFor(sid));
 		},
 		/** Nothing is held between calls. */
 		dispose(): void {},
