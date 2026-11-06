@@ -30,7 +30,7 @@ import { patchToolResults } from "./patch.js";
 import { CONTINUE_PROMPT, planRound } from "./plan.js";
 import { createLocks, logicalFromMessages, removeSessionFiles, sweepIdle, verifyAgainst } from "./store.js";
 
-export type QueryFn = (args: { prompt: string; options: Options }) => AsyncIterable<any> & { close?: () => void };
+export type QueryFn = (args: { prompt: string | AsyncIterable<any>; options: Options }) => AsyncIterable<any> & { close?: () => void };
 
 export interface StatelessStreamOptions {
 	/** The ONE folder (a fixed project cwd for the CLI) that holds every session file. */
@@ -168,7 +168,7 @@ export function createStatelessStreams(opts: StatelessStreamOptions) {
 				};
 				const rebuild = (reason: string) => { dbg(`rebuilding session ${sid}: ${reason}`); return build(); };
 
-				let prompt: string;
+				let prompt: string | AsyncIterable<any>;
 				let resume = false;
 				if (existsSync(path)) {
 					const mapId = (id: string) => sanitizedIds.get(id) ?? id;
@@ -187,7 +187,13 @@ export function createStatelessStreams(opts: StatelessStreamOptions) {
 					// Missing file is normal (first round, sweep, forget): build it from the transcript.
 					resume = build();
 				}
-				prompt = plan.promptText ?? (opts.continuePrompt ?? CONTINUE_PROMPT);
+				if (plan.promptContent) {
+					// Images in the current user message: streaming input with ONE user message, then the generator ends.
+					const content = plan.promptContent;
+					prompt = (async function* () {
+						yield { type: "user" as const, message: { role: "user" as const, content }, parent_tool_use_id: null, session_id: sid };
+					})();
+				} else prompt = plan.promptText ?? (opts.continuePrompt ?? CONTINUE_PROMPT);
 
 				const mcpServers = tools.length
 					? { [MCP_SERVER_NAME]: createToolServer(MCP_SERVER_NAME, tools.map((t: any) => ({

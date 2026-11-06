@@ -23,6 +23,29 @@ export interface RoundPlan {
 	results: Map<string, ToolResultPatch>;
 	/** Text of the user messages that follow the results (or follow the history), if any. */
 	promptText: string | undefined;
+	/** Text and image blocks of those user messages, in order. Set only when at least one image is present. */
+	promptContent: PromptBlock[] | undefined;
+}
+
+export type PromptBlock =
+	| { type: "text"; text: string }
+	| { type: "image"; source: { type: "base64"; media_type: string; data: string } };
+
+/** Ordered text/image blocks of the user messages; messages are separated like promptText ("\n\n"). */
+function blocksOf(users: Message[]): PromptBlock[] {
+	const out: PromptBlock[] = [];
+	for (const m of users as any[]) {
+		const parts: any[] = typeof m.content === "string" ? [{ type: "text", text: m.content }] : Array.isArray(m.content) ? m.content : [];
+		const mine: PromptBlock[] = [];
+		for (const b of parts) {
+			if (b?.type === "image") mine.push({ type: "image", source: { type: "base64", media_type: b.mimeType, data: b.data } });
+			else if (b?.type === "text" && b.text) mine.push({ type: "text", text: b.text });
+		}
+		if (!mine.length) continue;
+		if (out.length) out.push({ type: "text", text: "\n\n" });
+		out.push(...mine);
+	}
+	return out;
 }
 
 function textOf(content: unknown): string {
@@ -81,5 +104,7 @@ export function planRound(messages: Message[]): RoundPlan {
 		results.set(m.toolCallId, { content: resultContent(m.content), isError: !!m.isError });
 	}
 	const promptText = users.map((m: any) => textOf(m.content)).filter(Boolean).join("\n\n") || undefined;
-	return { system, tools, toolsDeclared, history: rest.slice(0, end), importable: rest.slice(0, afterUsers), results, promptText };
+	const hasImage = users.some((m: any) => Array.isArray(m.content) && m.content.some((b: any) => b?.type === "image"));
+	const promptContent = hasImage ? blocksOf(users) : undefined;
+	return { system, tools, toolsDeclared, history: rest.slice(0, end), importable: rest.slice(0, afterUsers), results, promptText, promptContent };
 }
