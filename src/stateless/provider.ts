@@ -291,6 +291,7 @@ async function consume(q: AsyncIterable<any>, model: Model<any>, output: Assista
 	const open = new Map<number, Open>(); // sdk block index -> streaming text/thinking block
 	const tools = new Map<number, Pending & { json: string }>(); // sdk block index -> tool block still receiving input
 	let pending: Pending[] = []; // closed tool calls of the current stream, not yet announced
+	const held: Pending[] = []; // closed calls of streams replaced by a new message_start before message_stop
 	const abandoned = new Set<number>(); // output.content indices to remove from the final message
 	let started = false, sawToolUse = false, result: any = null, sdkStop: string | undefined;
 	let sawStream = false, streamOpen = false, streamMsgId: string | undefined, streamBlockStart = 0;
@@ -327,9 +328,11 @@ async function consume(q: AsyncIterable<any>, model: Model<any>, output: Assista
 	const flushPending = () => { const p = pending; pending = []; p.forEach(announceTool); };
 
 	/** The stream Claude Code is retrying (or replacing): end what is open, forget the rest. */
-	const abandon = () => {
+	const abandon = (holdClosedCalls = false) => {
 		for (const o of open.values()) { endText(o); }
-		open.clear(); tools.clear(); pending = [];
+		open.clear(); tools.clear();
+		if (holdClosedCalls) held.push(...pending); // rescued at the end if no later stream re-emits a call
+		pending = [];
 		for (let i = streamBlockStart; i < output.content.length; i++) abandoned.add(i);
 		if (usageSnapshot) Object.assign(output.usage, usageSnapshot, { cost: { ...usageSnapshot.cost } });
 		streamOpen = false;
@@ -373,7 +376,7 @@ async function consume(q: AsyncIterable<any>, model: Model<any>, output: Assista
 		switch (ev.type) {
 			case "message_start":
 				// Still open from an earlier message_start: Claude Code retried that stream.
-				if (streamOpen) abandon();
+				if (streamOpen) abandon(true);
 				flushPending(); // a previous stream that ended with message_stop already flushed; this is a no-op
 				streamOpen = true;
 				streamMsgId = ev.message?.id;
@@ -459,6 +462,11 @@ async function consume(q: AsyncIterable<any>, model: Model<any>, output: Assista
 	// Closed tool calls of a stream that never saw message_stop are real (#146); anything still
 	// open was cut off: end it for pi, keep it out of the final message.
 	flushPending();
+	// A replaced stream's closed calls are real unless a later stream re-emitted calls (a retry).
+	if (held.length && !sawToolUse) {
+		cx.dbg(`rescued ${held.length} closed tool call(s) from an abandoned message (no retry re-emitted them): ${held.map((h) => `${h.name}#${h.id}`).join(", ")}`);
+		held.forEach(announceTool);
+	}
 	for (const o of open.values()) { endText(o); abandoned.add(o.piIndex); }
 	open.clear(); tools.clear();
 	if (abandoned.size) output.content = output.content.filter((_: any, i: number) => !abandoned.has(i));

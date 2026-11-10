@@ -511,6 +511,15 @@ describe("stateless robustness: ported upstream fixes", () => {
 		assert.equal(r.types.indexOf("toolcall_end") > r.types.indexOf("toolcall_start"), true);
 	});
 
+	it("a closed tool call of a replaced message is rescued once when no retry re-emits calls (work-wolfpack-7g4ZFMJ)", async () => {
+		const f = fake([start(), ...textBlock(0, "dropme"), ...toolBlock(1, "kept", '{"a":1}'), ...toolBlock(2, "kept2", '{"a":2}'),
+			ev({ type: "message_start", message: { id: "msg2", usage: {} } }), ...textBlock(0, "after"), delta("end_turn"), MAX_TURNS]);
+		const { msg, types } = await run(mk(f.queryFn), [user("x")]);
+		assert.equal(msg.stopReason, "toolUse");
+		assert.deepEqual(msg.content.map((b) => b.type + ":" + (b.id ?? b.text)), ["text:after", "toolCall:kept", "toolCall:kept2"]);
+		assert.equal(types.filter((t) => t === "toolcall_end").length, 2);
+	});
+
 	it("tool names map in/out of the mcp__custom-tools__ namespace; unserved tools are skipped", async () => {
 		const f = fake([start(), ...toolBlock(0, "t1", '{"a":1}'), ...toolBlock(1, "t2", '{}').map((e) => JSON.parse(JSON.stringify(e).replace("custom-tools__add", "custom-tools__nope"))), delta("tool_use"), MAX_TURNS]);
 		const { msg } = await run(mk(f.queryFn), [user("x")]);
