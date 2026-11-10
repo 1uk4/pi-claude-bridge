@@ -237,6 +237,13 @@ describe("stateless provider", () => {
 		assert.equal(getEventListeners(ac.signal, "abort").length, 0);
 	});
 
+	it("child env sets the CC behaviour flags stateless tool rounds depend on", () => {
+		const e = childEnv({});
+		assert.equal(e.CLAUDE_CODE_RESUME_INTERRUPTED_TURN_MAX_AGE_MS, "1");
+		assert.equal(e.CLAUDE_CODE_SILENT_TURN_REMINDER, "0");
+		assert.equal(e.CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH, "16384");
+	});
+
 	it("child env strips credentials and routing, keeps request logging off", () => {
 		const keys = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"];
 		const e = childEnv({ ...Object.fromEntries(keys.map((k) => [k, "x"])), KEEP: "1" });
