@@ -104,7 +104,8 @@ describe("stateless provider", () => {
 		assert.equal(msg.stopReason, "stop");
 		const o = f.calls[0];
 		assert.equal(o.options.resume, cliSessionId(piId)); assert.equal(o.options.sessionId, undefined);
-		assert.equal(o.prompt, CONTINUE_PROMPT);
+		assert.equal(o.prompt, "[Continue from the tool result above.]");
+		assert.doesNotMatch(o.prompt, /interrupted/);
 		const results = records(p).filter((r) => r.type === "user" && Array.isArray(r.message?.content)).flatMap((r) => r.message.content).filter((b) => b.type === "tool_result");
 		assert.deepEqual(results.map((b) => [b.tool_use_id, b.content, b.is_error]), [["ta", "RESULT=3", undefined], ["tb", "RESULT=7", undefined]]);
 		assert.equal(chain(p), before);

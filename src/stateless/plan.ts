@@ -4,9 +4,9 @@
 import type { Message } from "@earendil-works/pi-ai";
 import type { ResultContent, ToolResultPatch } from "./patch.js";
 
-export const CONTINUE_PROMPT =
-	"[Your session was interrupted and resumed. What precedes this ends with the tool result "
-	+ "you were waiting for. Continue the task from there.]";
+// Sent after every tool-result round (each opens a fresh query), so it must not claim an interruption.
+// A genuine resume (e.g. wolfd restart mid-turn) is indistinguishable here: the transcript tail is the same.
+export const CONTINUE_PROMPT = "[Continue from the tool result above.]";
 
 export interface RoundPlan {
 	/** Replayed system messages as one plain string. */
