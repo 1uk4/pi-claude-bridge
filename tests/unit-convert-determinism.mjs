@@ -102,6 +102,22 @@ it("repairToolPairing is idempotent", () => {
 	assert.deepEqual(repairToolPairing(once), once);
 });
 
+it("an empty tool result converts to Claude Code's no-output placeholder", () => {
+	const { anthropicMessages } = convertPiMessages([
+		{ role: "user", content: "go" },
+		{ role: "assistant", provider: "openrouter", content: [
+			{ type: "toolCall", id: "t1", name: "sudo_exec", arguments: {} },
+			{ type: "toolCall", id: "t2", name: "touch", arguments: {} },
+		] },
+		{ role: "toolResult", toolCallId: "t1", toolName: "sudo_exec", content: [{ type: "text", text: "" }], isError: true },
+		{ role: "toolResult", toolCallId: "t2", toolName: "touch", content: " " },
+	], new Map([["sudo_exec", "mcp__custom-tools__sudo_exec"], ["touch", "mcp__custom-tools__touch"]]));
+	assert.deepEqual(anthropicMessages[2].content.map((b) => [b.tool_use_id, b.content, !!b.is_error]), [
+		["t1", "Command failed with no output", true],
+		["t2", "(mcp__custom-tools__touch completed with no output)", false],
+	]);
+});
+
 // Prefix stability is satisfiable by a conversion that loses content
 // consistently, so pin the content too: the pre-ff60313c conversion passed both
 // invariants above while dropping every parallel result past the first.

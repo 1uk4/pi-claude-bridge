@@ -70,6 +70,15 @@ export function messageContentToText(
 // Tool results are flattened to text, which is how Claude Code stores most of
 // them. Images are the exception: they have no text form, so a result carrying
 // one keeps the block array shape instead (also what CC writes for screenshots).
+function nonEmptyToolResultContent(
+	msg: Extract<PiMessage, { role: "toolResult" }>,
+	customToolNameToSdk?: Map<string, string>,
+): string | Array<Record<string, unknown>> {
+	const content = toolResultContent(msg.content);
+	if (typeof content !== "string" || content.trim()) return content;
+	return noOutputPlaceholder(!!msg.isError, mapPiToolNameToSdk(msg.toolName, customToolNameToSdk));
+}
+
 function toolResultContent(
 	content: string | Array<{ type: string; text?: string; data?: string; mimeType?: string }>,
 ): string | Array<Record<string, unknown>> {
@@ -97,6 +106,13 @@ export type DroppedContent = {
 	providers: Set<string>;
 	other: Map<string, number>;
 };
+
+/** Claude Code never sends an empty tool result: live, it substitutes these placeholders,
+ *  and the API rejects an empty one marked is_error (400). Shared by the rebuild path
+ *  (convertPiMessages) and the stateless patch path (planRound), so both write identical text. */
+export function noOutputPlaceholder(isError: boolean, sdkToolName: string): string {
+	return isError ? "Command failed with no output" : `(${sdkToolName} completed with no output)`;
+}
 
 /** Convert pi message array to Anthropic API format. */
 export function convertPiMessages(
@@ -206,7 +222,7 @@ export function convertPiMessages(
 			// reorderAttachmentsForAPI (claude-code-rip src/utils/messages.ts:1481)
 			// bubbles attachments up to the nearest assistant or tool_result message
 			// and re-inserts them after it. The on-disk form differs, the order does not.
-			const block = { type: "tool_result", tool_use_id: sanitizeToolId(msg.toolCallId, sanitizedIds), content: toolResultContent(msg.content), is_error: msg.isError };
+			const block = { type: "tool_result", tool_use_id: sanitizeToolId(msg.toolCallId, sanitizedIds), content: nonEmptyToolResultContent(msg, customToolNameToSdk), is_error: msg.isError };
 			if (turnResults) {
 				turnResults.content.push(block);
 			} else {

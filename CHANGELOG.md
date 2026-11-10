@@ -2,6 +2,10 @@
 
 ## UNRELEASED
 
+- **Fix: stateless child env flags (upstream #145)** — the Claude Code child no longer inserts "Continue from where you left off." on every resumed tool round or the "user hasn't heard from you" reminder, and keeps MCP tool descriptions up to 16384 characters instead of 4096.
+- **Fix: thinking off in the stateless provider (upstream #152)** — with no pi reasoning level, pass `thinking: { type: "disabled" }` for reasoning models (not when the model's `thinkingLevelMap.off` is null), so Claude Code no longer thinks by default.
+- **Fix: empty tool results in the stateless provider (upstream #227)** — an empty result becomes `Command failed with no output` (error) or `(<tool> completed with no output)`, avoiding an API 400 on errored empty results; resumed and rebuilt sessions write identical text.
+- **Bump: Claude Agent SDK 0.3.321 (pinned) and cc-session-io 0.4.1**
 - **Bump: Claude Agent SDK 0.3.308 (Claude Code 2.1.308)** — Claude Code's new per-request log in session files is turned off; it made them about a third larger.
 - **Fix: queued steering keeps MCP input open through later turns (#172)** — Keep Claude Code's input open until each steer is replayed into a turn, then close after that turn completes. An error result still ends the query, so a steer Claude Code had queued can no longer run on and replace the failure. Thanks @Maverobot.
 - **Fix: abort ignored after a terminated tool batch (#200, issue #199)** — when a run ended with Claude Code's query parked at a tool call (`terminate: true`), aborting the next run did nothing. Each run that continues the query now binds its own signal. Thanks @orshih6 and @cootue.

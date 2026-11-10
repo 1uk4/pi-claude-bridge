@@ -3,6 +3,8 @@
 
 import type { Message } from "@earendil-works/pi-ai";
 import type { ResultContent, ToolResultPatch } from "./patch.js";
+import { noOutputPlaceholder } from "../convert.js";
+import { MCP_TOOL_PREFIX } from "../skills.js";
 
 // Sent after every tool-result round (each opens a fresh query), so it must not claim an interruption.
 // A genuine resume (e.g. wolfd restart mid-turn) is indistinguishable here: the transcript tail is the same.
@@ -101,7 +103,10 @@ export function planRound(messages: Message[]): RoundPlan {
 	const results = new Map<string, ToolResultPatch>();
 	while (end > 0 && rest[end - 1].role === "toolResult") {
 		const m: any = rest[--end];
-		results.set(m.toolCallId, { content: resultContent(m.content), isError: !!m.isError });
+		let content = resultContent(m.content);
+		// Same placeholder convertPiMessages writes on a rebuild, so resumed and rebuilt sessions stay identical.
+		if (typeof content === "string" && !content.trim()) content = noOutputPlaceholder(!!m.isError, `${MCP_TOOL_PREFIX}${m.toolName}`);
+		results.set(m.toolCallId, { content, isError: !!m.isError });
 	}
 	const promptText = users.map((m: any) => textOf(m.content)).filter(Boolean).join("\n\n") || undefined;
 	const hasImage = users.some((m: any) => Array.isArray(m.content) && m.content.some((b: any) => b?.type === "image"));
