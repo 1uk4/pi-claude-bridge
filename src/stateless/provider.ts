@@ -301,6 +301,14 @@ async function consume(q: AsyncIterable<any>, model: Model<any>, output: Assista
 	const ensureStart = () => { if (!started) { started = true; stream.push({ type: "start", partial: output } as any); } };
 	// Tool names: only tools pi served, matched in/out of the mcp__custom-tools__ namespace (case-insensitive).
 	const piName = (name: string): string | undefined => cx.served.get(name) ?? cx.served.get(name.toLowerCase());
+	// A name pi did not serve is still passed on, so pi answers "unknown tool" and the model can correct
+	// itself; dropping it would end the round as a silent stop. Logged with the served set, never the inputs.
+	const resolveName = (name: string): string => {
+		const served = piName(name);
+		if (served) return served;
+		cx.dbg({ event: "unserved_tool", name, served: [...new Set(cx.served.values())] });
+		return name.startsWith(MCP_TOOL_PREFIX) ? name.slice(MCP_TOOL_PREFIX.length) : name;
+	};
 
 	const startText = (kind: "text" | "thinking", init: string, sig = ""): Open => {
 		ensureStart();
@@ -363,8 +371,7 @@ async function consume(q: AsyncIterable<any>, model: Model<any>, output: Assista
 				if (b.thinking) stream.push({ type: "thinking_delta", contentIndex: o.piIndex, delta: b.thinking, partial: output } as any);
 				endText(o);
 			} else if (b.type === "tool_use") {
-				const name = piName(b.name);
-				if (name) announceTool({ id: b.id, name, input: b.input ?? {} });
+				announceTool({ id: b.id, name: resolveName(b.name), input: b.input ?? {} });
 			}
 		}
 		if (msg.usage) updateUsage(output, msg.usage, model);
@@ -390,8 +397,7 @@ async function consume(q: AsyncIterable<any>, model: Model<any>, output: Assista
 				if (b.type === "text") open.set(ev.index, startText("text", ""));
 				else if (b.type === "thinking" || b.type === "redacted_thinking") open.set(ev.index, startText("thinking", b.thinking ?? "", b.signature ?? b.data ?? ""));
 				else if (b.type === "tool_use") {
-					const name = piName(b.name);
-					if (name) tools.set(ev.index, { id: b.id, name, input: {}, json: "" }); // nothing is announced yet
+					tools.set(ev.index, { id: b.id, name: resolveName(b.name), input: {}, json: "" }); // nothing is announced yet
 				}
 				break;
 			}

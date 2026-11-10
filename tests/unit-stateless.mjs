@@ -520,8 +520,22 @@ describe("stateless robustness: ported upstream fixes", () => {
 		assert.equal(types.filter((t) => t === "toolcall_end").length, 2);
 	});
 
-	it("tool names map in/out of the mcp__custom-tools__ namespace; unserved tools are skipped", async () => {
-		const f = fake([start(), ...toolBlock(0, "t1", '{"a":1}'), ...toolBlock(1, "t2", '{}').map((e) => JSON.parse(JSON.stringify(e).replace("custom-tools__add", "custom-tools__nope"))), delta("tool_use"), MAX_TURNS]);
+	it("an unserved tool name is passed to pi (which answers unknown tool) and logged without its inputs (work-wolfpack-7g4ZFMJ)", async () => {
+		const events = [];
+		const nope = toolBlock(0, "t2", '{"secret":1}').map((e) => JSON.parse(JSON.stringify(e).replace("custom-tools__add", "custom-tools__nope")));
+		const f = fake([start(), ...nope, delta("tool_use"), MAX_TURNS]);
+		const { msg } = await run(createStatelessStreams({ sessionDir, claudeDir, queryFn: f.queryFn, debug: (e) => events.push(e) }), [user("x")]);
+		assert.equal(msg.stopReason, "toolUse");
+		assert.deepEqual(msg.content.map((b) => b.name), ["nope"]);
+		const logged = events.filter((e) => e.event === "unserved_tool");
+		assert.equal(logged.length, 1);
+		assert.equal(logged[0].name, PREFIX + "nope");
+		assert.deepEqual(logged[0].served, ["add"]);
+		assert.ok(!JSON.stringify(logged[0]).includes("secret"));
+	});
+
+	it("tool names map in/out of the mcp__custom-tools__ namespace", async () => {
+		const f = fake([start(), ...toolBlock(0, "t1", '{"a":1}'), delta("tool_use"), MAX_TURNS]);
 		const { msg } = await run(mk(f.queryFn), [user("x")]);
 		assert.deepEqual(msg.content.map((b) => b.name), ["add"]);
 		const up = fake([start(), ...toolBlock(0, "t3", '{}').map((e) => JSON.parse(JSON.stringify(e).replace("custom-tools__add", "CUSTOM-TOOLS__ADD"))), delta("tool_use"), MAX_TURNS]);
