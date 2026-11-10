@@ -61,7 +61,7 @@ export interface StatelessStreamOptions {
 	patchHook?: () => void;
 }
 
-interface RoundLog { sessionId: string; promptKind: string; firstEventMs: number | undefined; stopReason: string | undefined; kill: "idle" | "round" | undefined; errorClass?: string; raw?: string }
+interface RoundLog { sessionId: string; promptKind: string; firstEventMs: number | undefined; stopReason: string | undefined; kill: "idle" | "round" | undefined; errorClass?: string; raw?: string; rateLimit?: { status?: string; overageInUse?: boolean } }
 
 export const DEFAULT_IDLE_TIMEOUT_MS = 90_000;
 export const DEFAULT_ROUND_TIMEOUT_MS = 600_000;
@@ -250,7 +250,7 @@ export function createStatelessStreams(opts: StatelessStreamOptions) {
 					ok: output.stopReason !== "error" && output.stopReason !== "aborted", stopReason: output.stopReason,
 					sdkStopReason: round.stopReason ?? null, firstEventMs: round.firstEventMs ?? null, endMs: Date.now() - t0,
 					usage: { input: output.usage.input, output: output.usage.output, cacheRead: output.usage.cacheRead, cacheWrite: output.usage.cacheWrite },
-					kill: round.kill ?? null, error: output.errorMessage ?? null, errorClass: round.errorClass ?? null, errorRaw: round.raw ?? null,
+					kill: round.kill ?? null, error: output.errorMessage ?? null, errorClass: round.errorClass ?? null, errorRaw: round.raw ?? null, rateLimit: round.rateLimit ?? null,
 				});
 				release?.();
 			}
@@ -294,6 +294,7 @@ async function consume(q: AsyncIterable<any>, model: Model<any>, output: Assista
 	const open = new Map<number, Open>(); // sdk block index -> streaming text/thinking block
 	const tools = new Map<number, Pending & { json: string }>(); // sdk block index -> tool block still receiving input
 	let pending: Pending[] = []; // closed tool calls of the current stream, not yet announced
+	const held: Pending[] = []; // closed calls of streams replaced by a new message_start before message_stop
 	const abandoned = new Set<number>(); // output.content indices to remove from the final message
 	let started = false, sawToolUse = false, result: any = null, sdkStop: string | undefined;
 	let sawStream = false, streamOpen = false, streamMsgId: string | undefined, streamBlockStart = 0;
@@ -303,6 +304,14 @@ async function consume(q: AsyncIterable<any>, model: Model<any>, output: Assista
 	const ensureStart = () => { if (!started) { started = true; stream.push({ type: "start", partial: output } as any); } };
 	// Tool names: only tools pi served, matched in/out of the mcp__custom-tools__ namespace (case-insensitive).
 	const piName = (name: string): string | undefined => cx.served.get(name) ?? cx.served.get(name.toLowerCase());
+	// A name pi did not serve is still passed on, so pi answers "unknown tool" and the model can correct
+	// itself; dropping it would end the round as a silent stop. Logged with the served set, never the inputs.
+	const resolveName = (name: string): string => {
+		const served = piName(name);
+		if (served) return served;
+		cx.dbg({ event: "unserved_tool", name, served: [...new Set(cx.served.values())] });
+		return name.startsWith(MCP_TOOL_PREFIX) ? name.slice(MCP_TOOL_PREFIX.length) : name;
+	};
 
 	const startText = (kind: "text" | "thinking", init: string, sig = ""): Open => {
 		ensureStart();
@@ -330,9 +339,11 @@ async function consume(q: AsyncIterable<any>, model: Model<any>, output: Assista
 	const flushPending = () => { const p = pending; pending = []; p.forEach(announceTool); };
 
 	/** The stream Claude Code is retrying (or replacing): end what is open, forget the rest. */
-	const abandon = () => {
+	const abandon = (holdClosedCalls = false) => {
 		for (const o of open.values()) { endText(o); }
-		open.clear(); tools.clear(); pending = [];
+		open.clear(); tools.clear();
+		if (holdClosedCalls) held.push(...pending); // rescued at the end if no later stream re-emits a call
+		pending = [];
 		for (let i = streamBlockStart; i < output.content.length; i++) abandoned.add(i);
 		if (usageSnapshot) Object.assign(output.usage, usageSnapshot, { cost: { ...usageSnapshot.cost } });
 		streamOpen = false;
@@ -363,8 +374,7 @@ async function consume(q: AsyncIterable<any>, model: Model<any>, output: Assista
 				if (b.thinking) stream.push({ type: "thinking_delta", contentIndex: o.piIndex, delta: b.thinking, partial: output } as any);
 				endText(o);
 			} else if (b.type === "tool_use") {
-				const name = piName(b.name);
-				if (name) announceTool({ id: b.id, name, input: b.input ?? {} });
+				announceTool({ id: b.id, name: resolveName(b.name), input: b.input ?? {} });
 			}
 		}
 		if (msg.usage) updateUsage(output, msg.usage, model);
@@ -376,7 +386,7 @@ async function consume(q: AsyncIterable<any>, model: Model<any>, output: Assista
 		switch (ev.type) {
 			case "message_start":
 				// Still open from an earlier message_start: Claude Code retried that stream.
-				if (streamOpen) abandon();
+				if (streamOpen) abandon(true);
 				flushPending(); // a previous stream that ended with message_stop already flushed; this is a no-op
 				streamOpen = true;
 				streamMsgId = ev.message?.id;
@@ -390,8 +400,7 @@ async function consume(q: AsyncIterable<any>, model: Model<any>, output: Assista
 				if (b.type === "text") open.set(ev.index, startText("text", ""));
 				else if (b.type === "thinking" || b.type === "redacted_thinking") open.set(ev.index, startText("thinking", b.thinking ?? "", b.signature ?? b.data ?? ""));
 				else if (b.type === "tool_use") {
-					const name = piName(b.name);
-					if (name) tools.set(ev.index, { id: b.id, name, input: {}, json: "" }); // nothing is announced yet
+					tools.set(ev.index, { id: b.id, name: resolveName(b.name), input: {}, json: "" }); // nothing is announced yet
 				}
 				break;
 			}
@@ -440,6 +449,7 @@ async function consume(q: AsyncIterable<any>, model: Model<any>, output: Assista
 				if (m.type === "stream_event" && !m.parent_tool_use_id) handleStreamEvent(m.event);
 				else if (m.type === "assistant" && !m.parent_tool_use_id) processAssistant(m.message ? { ...m.message, error: m.error ?? m.message.error } : m);
 				else if (m.type === "result") result = m;
+				else if (m.type === "rate_limit_event") { const i = m.rate_limit_info; cx.round.rateLimit = { status: i?.status, overageInUse: i?.overageInUse }; }
 			}
 			reachedEnd = true;
 		} catch (e) {
@@ -461,7 +471,24 @@ async function consume(q: AsyncIterable<any>, model: Model<any>, output: Assista
 
 	// Closed tool calls of a stream that never saw message_stop are real (#146); anything still
 	// open was cut off: end it for pi, keep it out of the final message.
+	// A tool block cut before content_block_stop: complete JSON is a real call; anything else fails
+	// the round visibly (a silent stop would hide the lost call).
+	const cutOff: string[] = [];
+	for (const t of tools.values()) {
+		let input: unknown;
+		try { input = t.json ? JSON.parse(t.json) : undefined; } catch { input = undefined; }
+		if (input && typeof input === "object" && !Array.isArray(input)) pending.push({ id: t.id, name: t.name, input: input as Record<string, unknown> });
+		else cutOff.push(t.name);
+	}
+	tools.clear();
+	if (cutOff.length) cx.dbg({ event: "tool_cut_off", names: cutOff });
 	flushPending();
+	if (cutOff.length) throw new Error(`Claude Code's stream was cut off in the middle of a tool call (${cutOff.join(", ")}); retry the request`);
+	// A replaced stream's closed calls are real unless a later stream re-emitted calls (a retry).
+	if (held.length && !sawToolUse) {
+		cx.dbg(`rescued ${held.length} closed tool call(s) from an abandoned message (no retry re-emitted them): ${held.map((h) => `${h.name}#${h.id}`).join(", ")}`);
+		held.forEach(announceTool);
+	}
 	for (const o of open.values()) { endText(o); abandoned.add(o.piIndex); }
 	open.clear(); tools.clear();
 	if (abandoned.size) output.content = output.content.filter((_: any, i: number) => !abandoned.has(i));

@@ -511,16 +511,56 @@ describe("stateless robustness: ported upstream fixes", () => {
 	it("a tool call is dispatched only when its block closes (#146): a cut-off call never reaches pi", async () => {
 		const f = fake([start(), ev({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "cut", name: PREFIX + "add", input: {} } }), ev({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: '{"a":1' } }), OK]);
 		const { msg, types } = await run(mk(f.queryFn), [user("x")]);
-		assert.equal(msg.stopReason, "stop");
-		assert.equal(msg.content.length, 0);
+		assert.equal(msg.stopReason, "error"); // visible, not a silent stop (work-wolfpack-7g4ZFMJ)
+		assert.match(msg.errorMessage, /cut off/);
 		assert.ok(!types.includes("toolcall_end"));
 		const g = fake([start(), ...toolBlock(0, "ok", '{"a":1}'), delta("tool_use"), MAX_TURNS]);
 		const r = await run(mk(g.queryFn), [user("x")]);
 		assert.equal(r.types.indexOf("toolcall_end") > r.types.indexOf("toolcall_start"), true);
 	});
 
-	it("tool names map in/out of the mcp__custom-tools__ namespace; unserved tools are skipped", async () => {
-		const f = fake([start(), ...toolBlock(0, "t1", '{"a":1}'), ...toolBlock(1, "t2", '{}').map((e) => JSON.parse(JSON.stringify(e).replace("custom-tools__add", "custom-tools__nope"))), delta("tool_use"), MAX_TURNS]);
+	it("a closed tool call of a replaced message is rescued once when no retry re-emits calls (work-wolfpack-7g4ZFMJ)", async () => {
+		const f = fake([start(), ...textBlock(0, "dropme"), ...toolBlock(1, "kept", '{"a":1}'), ...toolBlock(2, "kept2", '{"a":2}'),
+			ev({ type: "message_start", message: { id: "msg2", usage: {} } }), ...textBlock(0, "after"), delta("end_turn"), MAX_TURNS]);
+		const { msg, types } = await run(mk(f.queryFn), [user("x")]);
+		assert.equal(msg.stopReason, "toolUse");
+		assert.deepEqual(msg.content.map((b) => b.type + ":" + (b.id ?? b.text)), ["text:after", "toolCall:kept", "toolCall:kept2"]);
+		assert.equal(types.filter((t) => t === "toolcall_end").length, 2);
+	});
+
+	it("a tool block with complete JSON cut before content_block_stop is still emitted (work-wolfpack-7g4ZFMJ)", async () => {
+		const f = fake([start(), ...textBlock(0, "hi"), ev({ type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "cutok", name: PREFIX + "add", input: {} } }), ev({ type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: '{"a":1}' } }), MAX_TURNS]);
+		const { msg } = await run(mk(f.queryFn), [user("x")]);
+		assert.equal(msg.stopReason, "toolUse");
+		assert.deepEqual(msg.content.map((b) => b.type + ":" + (b.id ?? b.text)), ["text:hi", "toolCall:cutok"]);
+		assert.deepEqual(msg.content[1].arguments, { a: 1 });
+	});
+
+	it("rate_limit_event overageInUse and status are recorded on round_end (work-wolfpack-7g4ZFMJ)", async () => {
+		const events = [];
+		const rl = { type: "rate_limit_event", rate_limit_info: { status: "allowed", overageInUse: true, token: "sk-ant-secret" } };
+		const f = fake([start(), ...textBlock(0, "k"), delta("end_turn"), rl, OK]);
+		await run(createStatelessStreams({ sessionDir, claudeDir, queryFn: f.queryFn, debug: (e) => events.push(e) }), [user("x")]);
+		const end = events.find((e) => e.event === "round_end");
+		assert.deepEqual(end.rateLimit, { status: "allowed", overageInUse: true });
+	});
+
+	it("an unserved tool name is passed to pi (which answers unknown tool) and logged without its inputs (work-wolfpack-7g4ZFMJ)", async () => {
+		const events = [];
+		const nope = toolBlock(0, "t2", '{"secret":1}').map((e) => JSON.parse(JSON.stringify(e).replace("custom-tools__add", "custom-tools__nope")));
+		const f = fake([start(), ...nope, delta("tool_use"), MAX_TURNS]);
+		const { msg } = await run(createStatelessStreams({ sessionDir, claudeDir, queryFn: f.queryFn, debug: (e) => events.push(e) }), [user("x")]);
+		assert.equal(msg.stopReason, "toolUse");
+		assert.deepEqual(msg.content.map((b) => b.name), ["nope"]);
+		const logged = events.filter((e) => e.event === "unserved_tool");
+		assert.equal(logged.length, 1);
+		assert.equal(logged[0].name, PREFIX + "nope");
+		assert.deepEqual(logged[0].served, ["add"]);
+		assert.ok(!JSON.stringify(logged[0]).includes("secret"));
+	});
+
+	it("tool names map in/out of the mcp__custom-tools__ namespace", async () => {
+		const f = fake([start(), ...toolBlock(0, "t1", '{"a":1}'), delta("tool_use"), MAX_TURNS]);
 		const { msg } = await run(mk(f.queryFn), [user("x")]);
 		assert.deepEqual(msg.content.map((b) => b.name), ["add"]);
 		const up = fake([start(), ...toolBlock(0, "t3", '{}').map((e) => JSON.parse(JSON.stringify(e).replace("custom-tools__add", "CUSTOM-TOOLS__ADD"))), delta("tool_use"), MAX_TURNS]);
