@@ -22,7 +22,7 @@ import { createToolServer } from "../mcp-server.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX } from "../skills.js";
 import { updateUsage } from "../usage.js";
 import { makeDebug, type DebugEvent } from "./debuglog.js";
-import { effortFor } from "./effort.js";
+import { effortFor, thinkingFor } from "./effort.js";
 import { childEnv } from "./env.js";
 import { BridgeError, roundError } from "./errors.js";
 import { makeGuard, type Guard } from "./guard.js";
@@ -145,6 +145,7 @@ export function createStatelessStreams(opts: StatelessStreamOptions) {
 				for (const t of tools) { served.set(`${MCP_TOOL_PREFIX}${t.name}`, t.name); served.set(`${MCP_TOOL_PREFIX}${t.name}`.toLowerCase(), t.name); }
 				round.promptKind = plan.promptText ? "user" : plan.results.size ? "tool_results" : "continue";
 				const effort = effortFor(model, options?.reasoning);
+				const thinking = thinkingFor(model, options?.reasoning);
 
 				// One round at a time per session: verify, patch and the query itself.
 				// An abort while waiting must end this round now, not when the holder finishes.
@@ -220,6 +221,8 @@ export function createStatelessStreams(opts: StatelessStreamOptions) {
 					includePartialMessages: true,
 					abortController: abort,
 					...(effort ? { effort } : {}),
+					// No reasoning level means thinking off; CC's default would turn it on.
+					...(thinking ? { thinking } : {}),
 					// Opus hides thinking text unless asked; only for models that think.
 					...(effort && (model as any).reasoning ? { extraArgs: { "thinking-display": "summarized" } } : {}),
 					stderr: (data: string) => { for (const line of data.split(/\r?\n/)) if (line) dbg({ event: "cli_stderr", sessionId: sid, line }); },

@@ -2,6 +2,10 @@
 
 ## UNRELEASED
 
+- **Fix: stateless child env flags (upstream #145)** — the Claude Code child no longer inserts "Continue from where you left off." on every resumed tool round or the "user hasn't heard from you" reminder, and keeps MCP tool descriptions up to 16384 characters instead of 4096.
+- **Fix: thinking off in the stateless provider (upstream #152)** — with no pi reasoning level, pass `thinking: { type: "disabled" }` for reasoning models (not when the model's `thinkingLevelMap.off` is null), so Claude Code no longer thinks by default.
+- **Fix: empty tool results in the stateless provider (upstream #227)** — an empty result becomes `Command failed with no output` (error) or `(<tool> completed with no output)`, avoiding an API 400 on errored empty results; resumed and rebuilt sessions write identical text.
+- **Bump: Claude Agent SDK 0.3.321 (pinned) and cc-session-io 0.4.1**
 - **Fix: stateless rescues tool calls of a replaced message** — closed tool calls of a stream replaced by a new `message_start` before `message_stop` were dropped, ending the round as a silent stop. They are now held and announced at the end of the round when no later stream re-emitted a call (a retry would), with a debug log line.
 - **Fix: stateless passes unserved tool names to pi** — a `tool_use` for a name pi did not serve was skipped silently. It now goes to pi, which answers "Tool X not found" so the model can correct itself; the name and the served set are logged, never the inputs.
 - **Fix: stateless tool block cut before `content_block_stop`** — a block with complete JSON input is emitted; an incomplete or unparseable one fails the round with a visible error instead of vanishing.

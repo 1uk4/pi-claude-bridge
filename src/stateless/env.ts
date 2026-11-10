@@ -34,5 +34,14 @@ export const STRIPPED_ENV = [
 export function childEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
 	const rest = { ...base };
 	for (const k of STRIPPED_ENV) delete rest[k];
-	return { ...rest, ...CC_CHILD_ENV, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" };
+	return {
+		...rest, ...CC_CHILD_ENV,
+		CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+		// A resumed session ending at a tool result looks like an interrupted turn to CC, which then inserts "Continue from where you left off."; every stateless tool round is that case (upstream 2edde93).
+		CLAUDE_CODE_RESUME_INTERRUPTED_TURN_MAX_AGE_MS: "1",
+		// Without this CC adds "The user hasn't heard from you in a while..." after 5 assistant messages with no visible text (upstream f502f5d).
+		CLAUDE_CODE_SILENT_TURN_REMINDER: "0",
+		// CC cuts MCP tool descriptions at 4096 characters by default (upstream f502f5d).
+		CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH: "16384",
+	};
 }
