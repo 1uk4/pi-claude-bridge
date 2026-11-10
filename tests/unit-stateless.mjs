@@ -617,6 +617,21 @@ describe("stateless robustness: error classes, reasoning, logging", () => {
 		assert.equal(effortFor({}, "xhigh"), "max");
 		assert.equal(effortFor({ thinkingLevelMap: { low: null } }, "low"), undefined);
 	});
+	it("no reasoning level disables thinking for reasoning models, unless the model marks off unsupported", async () => {
+		const a = fake([start(), ...textBlock(0, "k"), delta("end_turn"), OK]);
+		await run(mk(a.queryFn), [user("x")]);
+		assert.deepEqual(a.calls[0].options.thinking, { type: "disabled" });
+		const b = fake([start(), ...textBlock(0, "k"), delta("end_turn"), OK]);
+		await run(mk(b.queryFn), [user("x")], { reasoning: "high" });
+		assert.equal(b.calls[0].options.thinking, undefined);
+		const c = fake([start(), ...textBlock(0, "k"), delta("end_turn"), OK]);
+		const s = mk(c.queryFn).streamSimple({ ...MODEL, thinkingLevelMap: { off: null } }, { messages: [user("x")] }, { tools: TOOLS, sessionId: "off-null" });
+		await s.result();
+		assert.equal(c.calls[0].options.thinking, undefined);
+		const d = fake([start(), ...textBlock(0, "k"), delta("end_turn"), OK]);
+		await mk(d.queryFn).streamSimple({ ...MODEL, reasoning: false }, { messages: [user("x")] }, { tools: TOOLS, sessionId: "non-reasoning" }).result();
+		assert.equal(d.calls[0].options.thinking, undefined);
+	});
 	it("debug log: JSON lines with session id, prompt kind, timings, usage, stop reason, stderr, kills", async () => {
 		const log = join(root, "dbg", "bridge.jsonl");
 		const queryFn = (args) => { args.options.stderr("cli says hi\n"); return fake([start(), ...textBlock(0, "k"), delta("end_turn"), OK]).queryFn(args); };
