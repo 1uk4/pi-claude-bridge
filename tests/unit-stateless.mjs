@@ -11,7 +11,8 @@ import { isRetryableAssistantError } from "@earendil-works/pi-ai";
 import { getEventListeners } from "node:events";
 import { roundError, timeoutError } from "../src/stateless/errors.js";
 import { redact } from "../src/stateless/debuglog.js";
-import { createStatelessStreams, cliSessionId, CONTINUE_PROMPT, classifyError, effortFor, replaySystem, childEnv, patchToolResults } from "../src/stateless/index.js";
+import { createStatelessStreams, cliSessionId, CONTINUE_PROMPT, classifyError, effortFor, replaySystem, childEnv, patchToolResults, planRound } from "../src/stateless/index.js";
+import { convertPiMessages } from "../src/convert.js";
 
 const MODEL = { id: "sonnet", api: "x", provider: "p", name: "s", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1e5, maxTokens: 1e4, reasoning: true };
 const TOOLS = [{ name: "add", description: "add", parameters: { type: "object", properties: { a: { type: "number" }, b: { type: "number" } } } }];
@@ -631,6 +632,15 @@ describe("stateless robustness: error classes, reasoning, logging", () => {
 		const d = fake([start(), ...textBlock(0, "k"), delta("end_turn"), OK]);
 		await mk(d.queryFn).streamSimple({ ...MODEL, reasoning: false }, { messages: [user("x")] }, { tools: TOOLS, sessionId: "non-reasoning" }).result();
 		assert.equal(d.calls[0].options.thinking, undefined);
+	});
+	it("empty tool results get the no-output placeholder, identical on the patch and rebuild paths", () => {
+		const empty = (id, isError, content) => ({ role: "toolResult", toolCallId: id, toolName: "add", content, isError, timestamp: 3 });
+		const msgs = [user("go"), asst("t1", "t2"), empty("t1", true, [{ type: "text", text: "" }]), empty("t2", false, " ")];
+		const patched = planRound(msgs).results;
+		assert.deepEqual(patched.get("t1"), { content: "Command failed with no output", isError: true });
+		assert.deepEqual(patched.get("t2"), { content: `(${PREFIX}add completed with no output)`, isError: false });
+		const rebuilt = convertPiMessages(msgs, new Map([["add", PREFIX + "add"]])).anthropicMessages.at(-1).content;
+		assert.deepEqual(rebuilt.map((b) => [b.tool_use_id, b.content]), [["t1", patched.get("t1").content], ["t2", patched.get("t2").content]]);
 	});
 	it("debug log: JSON lines with session id, prompt kind, timings, usage, stop reason, stderr, kills", async () => {
 		const log = join(root, "dbg", "bridge.jsonl");
