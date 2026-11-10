@@ -528,6 +528,15 @@ describe("stateless robustness: ported upstream fixes", () => {
 		assert.deepEqual(msg.content[1].arguments, { a: 1 });
 	});
 
+	it("rate_limit_event overageInUse and status are recorded on round_end (work-wolfpack-7g4ZFMJ)", async () => {
+		const events = [];
+		const rl = { type: "rate_limit_event", rate_limit_info: { status: "allowed", overageInUse: true, token: "sk-ant-secret" } };
+		const f = fake([start(), ...textBlock(0, "k"), delta("end_turn"), rl, OK]);
+		await run(createStatelessStreams({ sessionDir, claudeDir, queryFn: f.queryFn, debug: (e) => events.push(e) }), [user("x")]);
+		const end = events.find((e) => e.event === "round_end");
+		assert.deepEqual(end.rateLimit, { status: "allowed", overageInUse: true });
+	});
+
 	it("an unserved tool name is passed to pi (which answers unknown tool) and logged without its inputs (work-wolfpack-7g4ZFMJ)", async () => {
 		const events = [];
 		const nope = toolBlock(0, "t2", '{"secret":1}').map((e) => JSON.parse(JSON.stringify(e).replace("custom-tools__add", "custom-tools__nope")));

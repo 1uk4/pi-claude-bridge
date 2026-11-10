@@ -61,7 +61,7 @@ export interface StatelessStreamOptions {
 	patchHook?: () => void;
 }
 
-interface RoundLog { sessionId: string; promptKind: string; firstEventMs: number | undefined; stopReason: string | undefined; kill: "idle" | "round" | undefined; errorClass?: string; raw?: string }
+interface RoundLog { sessionId: string; promptKind: string; firstEventMs: number | undefined; stopReason: string | undefined; kill: "idle" | "round" | undefined; errorClass?: string; raw?: string; rateLimit?: { status?: string; overageInUse?: boolean } }
 
 export const DEFAULT_IDLE_TIMEOUT_MS = 90_000;
 export const DEFAULT_ROUND_TIMEOUT_MS = 600_000;
@@ -247,7 +247,7 @@ export function createStatelessStreams(opts: StatelessStreamOptions) {
 					ok: output.stopReason !== "error" && output.stopReason !== "aborted", stopReason: output.stopReason,
 					sdkStopReason: round.stopReason ?? null, firstEventMs: round.firstEventMs ?? null, endMs: Date.now() - t0,
 					usage: { input: output.usage.input, output: output.usage.output, cacheRead: output.usage.cacheRead, cacheWrite: output.usage.cacheWrite },
-					kill: round.kill ?? null, error: output.errorMessage ?? null, errorClass: round.errorClass ?? null, errorRaw: round.raw ?? null,
+					kill: round.kill ?? null, error: output.errorMessage ?? null, errorClass: round.errorClass ?? null, errorRaw: round.raw ?? null, rateLimit: round.rateLimit ?? null,
 				});
 				release?.();
 			}
@@ -446,6 +446,7 @@ async function consume(q: AsyncIterable<any>, model: Model<any>, output: Assista
 				if (m.type === "stream_event" && !m.parent_tool_use_id) handleStreamEvent(m.event);
 				else if (m.type === "assistant" && !m.parent_tool_use_id) processAssistant(m.message ? { ...m.message, error: m.error ?? m.message.error } : m);
 				else if (m.type === "result") result = m;
+				else if (m.type === "rate_limit_event") { const i = m.rate_limit_info; cx.round.rateLimit = { status: i?.status, overageInUse: i?.overageInUse }; }
 			}
 			reachedEnd = true;
 		} catch (e) {
