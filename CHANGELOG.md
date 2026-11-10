@@ -2,6 +2,10 @@
 
 ## UNRELEASED
 
+- **Fix: stateless rescues tool calls of a replaced message** — closed tool calls of a stream replaced by a new `message_start` before `message_stop` were dropped, ending the round as a silent stop. They are now held and announced at the end of the round when no later stream re-emitted a call (a retry would), with a debug log line.
+- **Fix: stateless passes unserved tool names to pi** — a `tool_use` for a name pi did not serve was skipped silently. It now goes to pi, which answers "Tool X not found" so the model can correct itself; the name and the served set are logged, never the inputs.
+- **Fix: stateless tool block cut before `content_block_stop`** — a block with complete JSON input is emitted; an incomplete or unparseable one fails the round with a visible error instead of vanishing.
+- **Add: `rateLimit` on stateless `round_end`** — records the `rate_limit_event` `status` and `overageInUse` in the debug log (log only, no notification).
 - **Bump: Claude Agent SDK 0.3.308 (Claude Code 2.1.308)** — Claude Code's new per-request log in session files is turned off; it made them about a third larger.
 - **Fix: queued steering keeps MCP input open through later turns (#172)** — Keep Claude Code's input open until each steer is replayed into a turn, then close after that turn completes. An error result still ends the query, so a steer Claude Code had queued can no longer run on and replace the failure. Thanks @Maverobot.
 - **Fix: abort ignored after a terminated tool batch (#200, issue #199)** — when a run ended with Claude Code's query parked at a tool call (`terminate: true`), aborting the next run did nothing. Each run that continues the query now binds its own signal. Thanks @orshih6 and @cootue.
