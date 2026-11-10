@@ -503,8 +503,8 @@ describe("stateless robustness: ported upstream fixes", () => {
 	it("a tool call is dispatched only when its block closes (#146): a cut-off call never reaches pi", async () => {
 		const f = fake([start(), ev({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "cut", name: PREFIX + "add", input: {} } }), ev({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: '{"a":1' } }), OK]);
 		const { msg, types } = await run(mk(f.queryFn), [user("x")]);
-		assert.equal(msg.stopReason, "stop");
-		assert.equal(msg.content.length, 0);
+		assert.equal(msg.stopReason, "error"); // visible, not a silent stop (work-wolfpack-7g4ZFMJ)
+		assert.match(msg.errorMessage, /cut off/);
 		assert.ok(!types.includes("toolcall_end"));
 		const g = fake([start(), ...toolBlock(0, "ok", '{"a":1}'), delta("tool_use"), MAX_TURNS]);
 		const r = await run(mk(g.queryFn), [user("x")]);
@@ -518,6 +518,14 @@ describe("stateless robustness: ported upstream fixes", () => {
 		assert.equal(msg.stopReason, "toolUse");
 		assert.deepEqual(msg.content.map((b) => b.type + ":" + (b.id ?? b.text)), ["text:after", "toolCall:kept", "toolCall:kept2"]);
 		assert.equal(types.filter((t) => t === "toolcall_end").length, 2);
+	});
+
+	it("a tool block with complete JSON cut before content_block_stop is still emitted (work-wolfpack-7g4ZFMJ)", async () => {
+		const f = fake([start(), ...textBlock(0, "hi"), ev({ type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "cutok", name: PREFIX + "add", input: {} } }), ev({ type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: '{"a":1}' } }), MAX_TURNS]);
+		const { msg } = await run(mk(f.queryFn), [user("x")]);
+		assert.equal(msg.stopReason, "toolUse");
+		assert.deepEqual(msg.content.map((b) => b.type + ":" + (b.id ?? b.text)), ["text:hi", "toolCall:cutok"]);
+		assert.deepEqual(msg.content[1].arguments, { a: 1 });
 	});
 
 	it("an unserved tool name is passed to pi (which answers unknown tool) and logged without its inputs (work-wolfpack-7g4ZFMJ)", async () => {

@@ -467,7 +467,19 @@ async function consume(q: AsyncIterable<any>, model: Model<any>, output: Assista
 
 	// Closed tool calls of a stream that never saw message_stop are real (#146); anything still
 	// open was cut off: end it for pi, keep it out of the final message.
+	// A tool block cut before content_block_stop: complete JSON is a real call; anything else fails
+	// the round visibly (a silent stop would hide the lost call).
+	const cutOff: string[] = [];
+	for (const t of tools.values()) {
+		let input: unknown;
+		try { input = t.json ? JSON.parse(t.json) : undefined; } catch { input = undefined; }
+		if (input && typeof input === "object" && !Array.isArray(input)) pending.push({ id: t.id, name: t.name, input: input as Record<string, unknown> });
+		else cutOff.push(t.name);
+	}
+	tools.clear();
+	if (cutOff.length) cx.dbg({ event: "tool_cut_off", names: cutOff });
 	flushPending();
+	if (cutOff.length) throw new Error(`Claude Code's stream was cut off in the middle of a tool call (${cutOff.join(", ")}); retry the request`);
 	// A replaced stream's closed calls are real unless a later stream re-emitted calls (a retry).
 	if (held.length && !sawToolUse) {
 		cx.dbg(`rescued ${held.length} closed tool call(s) from an abandoned message (no retry re-emitted them): ${held.map((h) => `${h.name}#${h.id}`).join(", ")}`);
